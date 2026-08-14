@@ -50,6 +50,8 @@ public final class Main {
                 return metrics(args);
             case "report":
                 return report(args);
+            case "player-review":
+                return playerReview(args);
             case "download":
                 return download(args);
             case "help":
@@ -156,6 +158,26 @@ public final class Main {
         return 0;
     }
 
+    private int playerReview(String[] args) throws Exception {
+        if (args.length < 3) {
+            log.error("player-review requires an output directory and a player selector " +
+                "(hero/name/player index, e.g. out/8943544578 slark)");
+            return 2;
+        }
+        Path dir = Path.of(args[1]);
+        if (!Files.exists(dir.resolve("metrics.json"))) {
+            log.error("missing metrics.json in {} (run `metrics` first)", dir.toAbsolutePath());
+            return 1;
+        }
+        dev.dota.etl.report.PlayerReviewGenerator generator =
+            new dev.dota.etl.report.PlayerReviewGenerator(dir, args[2]);
+        String prompt = generator.generatePrompt();
+        log.info("player review prompt written to {}", generator.promptFile().toAbsolutePath());
+        log.info("prompt length {} chars (dry-run: copy the prompt into any LLM)",
+            prompt.length());
+        return 0;
+    }
+
     private static java.util.Optional<String> arg(String[] args, String name) {
         for (int i = 0; i < args.length - 1; i++) {
             if (args[i].equals(name)) {
@@ -189,6 +211,10 @@ public final class Main {
                   Assemble a Chinese LLM review prompt from metrics.json into prompt.md
                   (dry-run only, no API call).
 
+              dota-replay-etl player-review <outputDir> <heroOrNameOrIndex>
+                  Assemble a single-player Chinese review prompt (出装/团战/打钱/决策)
+                  for one hero into player-review-<hero>.md (dry-run, no API call).
+
               dota-replay-etl download <matchId> [--out FILE]
                   Download and decompress a replay by match id (requires STEAM_API_KEY).
 
@@ -199,6 +225,7 @@ public final class Main {
               <out>/<matchId>/metrics.json       computed metrics (via `metrics` command)
               <out>/<matchId>/metrics.duckdb     persisted tables for ad-hoc SQL
               <out>/<matchId>/prompt.md          LLM review prompt (via `report` command)
+              <out>/<matchId>/player-review-<hero>.md  single-player review prompt (via `player-review`)
             """);
     }
 

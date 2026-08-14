@@ -19,6 +19,7 @@ Produces `target/dota-replay-etl-0.1.0-SNAPSHOT.jar` (shaded fat jar).
 dota-replay-etl analyze <matchIdOrFile> [--out DIR] [--cache DIR] [--sample SEC]
 dota-replay-etl metrics <outputDir>
 dota-replay-etl report <outputDir>
+dota-replay-etl player-review <outputDir> <heroOrNameOrIndex>
 dota-replay-etl download <matchId> [--out FILE]
 ```
 
@@ -39,6 +40,10 @@ java -jar target/dota-replay-etl-0.1.0-SNAPSHOT.jar metrics out/6676393091
 
 # assemble a Chinese LLM review prompt (dry-run, writes prompt.md; no API call)
 java -jar target/dota-replay-etl-0.1.0-SNAPSHOT.jar report out/6676393091
+
+# assemble a single-player review prompt for one hero
+# (selector: hero_key, hero name, player name, or player index)
+java -jar target/dota-replay-etl-0.1.0-SNAPSHOT.jar player-review out/8943544578 slark
 ```
 
 ### Replay download
@@ -63,6 +68,7 @@ Downloaded replays are cached under `--cache` (default `replays/`) and reused if
   metrics.json       computed metrics (from the `metrics` command)
   metrics.duckdb     same metrics as persisted DuckDB tables for ad-hoc SQL
   prompt.md          LLM review prompt (from the `report` command, dry-run)
+  player-review-<hero>.md  single-player review prompt (from `player-review`, dry-run)
 ```
 
 ### match.json
@@ -141,7 +147,9 @@ DuckDB, computes the metrics below, and writes `metrics.json` plus a persistent
                     "participants": ["ember_spirit", "enchantress", "lone_druid", ...] } ],
   "gold_curves": [ { "hero": "lone_druid", "points": [ {"t": 795.0, "gold": 600}, ... ] } ],
   "xp_curves": [ { "hero": "lone_druid", "points": [ {"t": 795.0, "xp": 0}, ... ] } ],
-  "item_timeline": [ { "hero": "marci", "items": [ {"item": "item_orb_of_venom", "t": 827.5}, ... ] } ]
+  "item_timeline": [ { "hero": "marci", "items": [ {"item": "item_orb_of_venom", "t": 827.5}, ... ] } ],
+  "damage": [ { "hero": "lone_druid", "dealt_total": 25000, "taken_total": 18000,
+                "per_minute": [ {"min": 13, "dealt": 800}, ... ] } ]
 }
 ```
 
@@ -158,6 +166,9 @@ Notes:
   (attacker and target are both heroes) and `deaths` are hero deaths. `hero_damage` in each
   episode counts damage dealt *by* heroes. The knobs (`BUCKET_SEC`, `WEIGHT_DEATH`,
   `MIN_ACTIVE_SCORE`) live at the top of `MetricsRunner`.
+- `damage` is per-hero hero-to-hero damage: `dealt_total` (attacker is a hero), `taken_total`
+  (target is a hero, any source), and `per_minute` buckets of damage dealt. Drives the
+  single-player review's engagement windows.
 
 ## LLM review prompt (`report`)
 
@@ -168,6 +179,19 @@ recalculating values, and asks it to close with an **MVP** and a **worst player*
 with data-backed reasons. The economy section shows the per-minute team income differential
 (carry-forward of each hero's cumulative income, labelled as a trend, not a bank balance).
 Copy `prompt.md` into any LLM to get the report, or paste it into a future `--api` mode.
+
+## Single-player review (`player-review`)
+
+`dota-replay-etl player-review <out>/<matchId> <heroOrNameOrIndex>` assembles a focused
+review prompt for one hero into `player-review-<hero>.md` (dry-run). The selector matches a
+roster entry by `hero_key`, hero name, player name, or player index. Beyond the match-level
+metrics it adds: the hero's full purchase timeline, kills/deaths with positions, an income
+comparison against the enemy team's top earner (with auto-detected overtake / stall facts),
+per-minute hero damage, the fights the hero actually participated in (with kill/death outcome
+per fight), and a farming/position table derived from `players.ndjson` (share of time spent in
+the enemy half and deep in enemy territory per game phase, split along the river diagonal).
+The prompt asks for a data-backed review of 出装决策 / 团战切入 / 打钱路线 / 关键决策 plus a
+prioritised improvement list. Position facts are skipped when `players.ndjson` is absent.
 
 ## How extraction works
 
@@ -191,5 +215,6 @@ mvn test
 ```
 
 Covers coordinate conversion, hero name parsing, match-id parsing from filenames, NDJSON
-writer round-trip / overwrite semantics, and the DuckDB metrics computation (summary, roster,
-kills, teamfights, curves, item timeline) against a synthetic fixture.
+writer round-trip / overwrite semantics, the DuckDB metrics computation (summary, roster,
+kills, teamfights, curves, item timeline, damage) against a synthetic fixture, the match
+review prompt assembly, and the single-player review prompt assembly.

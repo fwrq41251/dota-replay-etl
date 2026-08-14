@@ -325,7 +325,7 @@ public final class ReportGenerator {
     // helpers
     // ------------------------------------------------------------------
 
-    private static String side(int team) {
+    static String side(int team) {
         return switch (team) {
             case 2 -> "天辉";
             case 3 -> "夜魇";
@@ -333,7 +333,7 @@ public final class ReportGenerator {
         };
     }
 
-    private static String heroShort(String raw) {
+    static String heroShort(String raw) {
         if (raw == null) {
             return "-";
         }
@@ -341,7 +341,7 @@ public final class ReportGenerator {
         return s.isEmpty() ? "-" : s;
     }
 
-    private static String fmt(double v) {
+    static String fmt(double v) {
         return String.format("%.1f", v).replace(".0", "");
     }
 }

@@ -11,6 +11,7 @@ import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -78,6 +79,7 @@ public final class MetricsRunner {
             addGoldCurves(conn, metrics);
             addXpCurves(conn, metrics);
             addItemTimeline(conn, metrics);
+            addDamage(conn, metrics);
             persistTables(conn);
         }
         return metrics;
@@ -313,6 +315,54 @@ public final class MetricsRunner {
             putStr(it, "item", (String) row[1]);
             it.put("t", round1(dbl(row[2])));
         }
+    }
+
+    private void addDamage(Connection conn, ObjectNode root) throws Exception {
+        ArrayNode arr = root.putArray("damage");
+        Map<String, ObjectNode> byHero = new LinkedHashMap<>();
+        Map<String, long[]> totals = new LinkedHashMap<>();
+        for (Object[] row : query(conn, """
+            SELECT attacker_key AS hero, FLOOR(t / 60) * 60 AS b, SUM(value) AS v
+            FROM combatlog_v
+            WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero
+              AND attacker LIKE 'npc_dota_hero_%%' AND attacker_key IS NOT NULL
+            GROUP BY attacker_key, b ORDER BY attacker_key, b
+            """)) {
+            String hero = (String) row[0];
+            ObjectNode node = byHero.get(hero);
+            if (node == null) {
+                node = arr.addObject();
+                putStr(node, "hero", hero);
+                node.put("dealt_total", 0L);
+                node.putArray("per_minute");
+                byHero.put(hero, node);
+                totals.put(hero, new long[]{0L});
+            }
+            long v = longOf(row[2]);
+            totals.get(hero)[0] += v;
+            ObjectNode pt = ((ArrayNode) node.get("per_minute")).addObject();
+            pt.put("min", (long) dbl(row[1]) / 60);
+            pt.put("dealt", v);
+        }
+        for (Object[] row : query(conn, """
+            SELECT target_key AS hero, SUM(value) AS v
+            FROM combatlog_v
+            WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND target_key IS NOT NULL
+            GROUP BY target_key
+            """)) {
+            String hero = (String) row[0];
+            ObjectNode node = byHero.get(hero);
+            if (node == null) {
+                node = arr.addObject();
+                putStr(node, "hero", hero);
+                node.put("dealt_total", 0L);
+                node.putArray("per_minute");
+                byHero.put(hero, node);
+                totals.put(hero, new long[]{0L});
+            }
+            node.put("taken_total", longOf(row[1]));
+        }
+        byHero.forEach((hero, node) -> node.put("dealt_total", totals.get(hero)[0]));
     }
 
     private void persistTables(Connection conn) throws Exception {
