@@ -1,0 +1,16 @@
+# build output
+target/
+
+# generated extraction / metrics / report output
+out/
+
+# downloaded replay cache
+replays/
+*.dem
+*.dem.bz2
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store

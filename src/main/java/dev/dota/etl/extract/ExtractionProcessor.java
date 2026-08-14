@@ -1,0 +1,578 @@
+package dev.dota.etl.extract;
+
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import dev.dota.etl.sink.NdjsonWriter;
+import skadistats.clarity.event.Insert;
+import skadistats.clarity.io.Util;
+import skadistats.clarity.model.CombatLogEntry;
+import skadistats.clarity.model.DTClass;
+import skadistats.clarity.model.EngineId;
+import skadistats.clarity.model.Entity;
+import skadistats.clarity.model.FieldPath;
+import skadistats.clarity.processor.entities.Entities;
+import skadistats.clarity.processor.entities.OnEntityUpdated;
+import skadistats.clarity.processor.entities.UsesEntities;
+import skadistats.clarity.processor.gameevents.OnCombatLogEntry;
+import skadistats.clarity.processor.reader.OnTickEnd;
+import skadistats.clarity.processor.runner.Context;
+import skadistats.clarity.processor.sendtables.DTClasses;
+import skadistats.clarity.processor.sendtables.OnDTClassesComplete;
+import skadistats.clarity.wire.dota.common.proto.DOTACombatLog;
+
+import java.util.Objects;
+
+/**
+ * Annotation-driven extraction processor for a single .dem file.
+ *
+ * Emits two NDJSON streams:
+ *  - combatlog.ndjson: every combat log entry
+ *  - players.ndjson:   per-player state sampled every {@code sampleIntervalSec}
+ *                      seconds of in-game clock (combat-log time)
+ *
+ * Match-level facts are exposed via {@link #lastTick()} and {@link #combatLogCount()}
+ * and written to match.json by {@link ReplayExtractor}.
+ *
+ * Per-player state is split across two entities:
+ *  - PlayerResource holds team/name/level/kills/deaths/assists + the selected hero handle
+ *  - the hero entity holds position (CBodyComponent cell+vec), health/mana and item handles
+ * Hero assignment is deferred to tick end because the hero entity spawns after the
+ * PlayerResource update inside the same tick.
+ *
+ * Sampling is driven by the in-game clock carried by combat log timestamps rather than
+ * by absolute demo ticks: at the moment the actual game begins, the demo tick stream
+ * shifts parity (a Source 2 replay quirk), so a naive {@code tick % n == 0} rule stops
+ * firing for the whole match. Combat log events fire throughout the game, so the latest
+ * seen game time is a reliable clock.
+ */
+@UsesEntities
+public class ExtractionProcessor {
+
+    private static final String[] HERO_PREFIX_S2 = {"CDOTA_Unit_Hero_"};
+    private static final String[] HERO_PREFIX_S1 = {"DT_DOTA_Unit_Hero_"};
+    private static final int ITEM_SLOTS = 12;
+
+    @Insert
+    private Context ctx;
+
+    @Insert
+    private Entities entities;
+
+    @Insert
+    private DTClasses dtClasses;
+
+    private final NdjsonWriter combatLogWriter;
+    private final NdjsonWriter playersWriter;
+    private final MatchMeta matchMeta;
+    private final float sampleIntervalSec;
+
+    private DTClass playerResourceClass;
+    private Entity playerResourceEntity;
+    private boolean s2;
+    private boolean legacyFormat;
+
+    private final PlayerLookup[] players = new PlayerLookup[10];
+    private final int[] pendingHeroHandles = new int[10];
+    private DataLookup radiantData;
+    private DataLookup direData;
+
+    private int lastTick;
+    private long combatLogCount;
+    private float currentGameTime;
+    private float nextSampleAt = Float.NaN;
+    private boolean initialSampleWritten;
+
+    public ExtractionProcessor(NdjsonWriter combatLogWriter, NdjsonWriter playersWriter,
+                               MatchMeta matchMeta, int sampleIntervalSec) {
+        this.combatLogWriter = combatLogWriter;
+        this.playersWriter = playersWriter;
+        this.matchMeta = matchMeta;
+        this.sampleIntervalSec = Math.max(1, sampleIntervalSec);
+    }
+
+    @OnDTClassesComplete
+    protected void onDtClassesComplete() {
+        s2 = ctx.getEngineType().getId() == EngineId.DOTA_S2;
+        String prefix = s2 ? "CDOTA_" : "DT_DOTA_";
+        playerResourceClass = dtClasses.forDtName(prefix + "PlayerResource");
+        if (playerResourceClass == null) {
+            throw new IllegalStateException("cannot find PlayerResource datatable class for engine " + ctx.getEngineType());
+        }
+        legacyFormat = playerResourceClass.getFieldPathForName("m_iPlayerTeams." + Util.arrayIdxToString(0)) != null;
+        for (int i = 0; i < 10; i++) {
+            players[i] = new PlayerLookup(playerResourceClass, i, legacyFormat);
+        }
+    }
+
+    @OnEntityUpdated
+    protected void onEntityUpdated(Entity e, FieldPath[] changed, int nChanged) {
+        if (playerResourceClass == null || e.getDtClass() != playerResourceClass) {
+            return;
+        }
+        for (int p = 0; p < 10; p++) {
+            PlayerLookup lookup = players[p];
+            if (lookup.selectedHeroPath != null && lookup.containsAny(changed, nChanged, lookup.selectedHeroPath)) {
+                Integer handle = intOrNull(e, lookup.selectedHeroPath);
+                pendingHeroHandles[p] = handle == null ? -1 : handle;
+            }
+        }
+    }
+
+    @OnCombatLogEntry
+    protected void onCombatLog(CombatLogEntry cle) {
+        float t = cle.getTimestamp();
+        if (t > 0) {
+            currentGameTime = Math.max(currentGameTime, t);
+        }
+        ObjectNode rec = combatLogWriter.newRecord();
+        rec.put("t", t);
+        DOTACombatLog.DOTA_COMBATLOG_TYPES type = safeType(cle);
+        put(rec, "type", type == null ? null : type.name());
+        rec.put("type_id", type == null ? -1 : type.getNumber());
+        put(rec, "attacker", str(cle.getAttackerName()));
+        rec.put("attacker_illusion", cle.isAttackerIllusion());
+        rec.put("attacker_hero", cle.isAttackerHero());
+        put(rec, "target", str(cle.getTargetName()));
+        rec.put("target_illusion", cle.isTargetIllusion());
+        rec.put("target_hero", cle.isTargetHero());
+        rec.put("target_self", cle.isTargetSelf());
+        put(rec, "inflictor", str(cle.getInflictorName()));
+        put(rec, "value", num(cle.getValue()));
+        put(rec, "value_name", str(cle.getValueName()));
+        put(rec, "health", num(cle.getHealth()));
+        put(rec, "x", num(cle.getLocationX()));
+        put(rec, "y", num(cle.getLocationY()));
+        put(rec, "attacker_team", num(cle.getAttackerTeam()));
+        put(rec, "target_team", num(cle.getTargetTeam()));
+        put(rec, "visible_radiant", cle.isVisibleRadiant());
+        put(rec, "visible_dire", cle.isVisibleDire());
+        put(rec, "gold_reason", num(cle.getGoldReason()));
+        put(rec, "xp_reason", num(cle.getXpReason()));
+        put(rec, "ability_level", num(cle.getAbilityLevel()));
+        put(rec, "rune_type", num(cle.getRuneType()));
+        put(rec, "stack_count", num(cle.getStackCount()));
+        put(rec, "last_hits", num(cle.getLastHits()));
+        put(rec, "networth", num(cle.getNetworth()));
+        put(rec, "obs_wards", num(cle.getObsWardsPlaced()));
+        put(rec, "neutral_camp_type", num(cle.getNeutralCampType()));
+        put(rec, "modifier_duration", num(cle.getModifierDuration()));
+        put(rec, "stun_duration", num(cle.getStunDuration()));
+        put(rec, "slow_duration", num(cle.getSlowDuration()));
+        put(rec, "damage_type", num(cle.getDamageType()));
+        put(rec, "damage_category", num(cle.getDamageCategory()));
+        put(rec, "event_location", num(cle.getEventLocation()));
+        put(rec, "xpm", num(cle.getXpm()));
+        put(rec, "gpm", num(cle.getGpm()));
+        put(rec, "attacker_hero_level", num(cle.getAttackerHeroLevel()));
+        put(rec, "target_hero_level", num(cle.getTargetHeroLevel()));
+        put(rec, "target_source", str(cle.getTargetSourceName()));
+        put(rec, "damage_source", str(cle.getDamageSourceName()));
+        if (cle.hasAssistPlayers()) {
+            var assists = cle.getAssistPlayers();
+            if (!assists.isEmpty()) {
+                com.fasterxml.jackson.databind.node.ArrayNode arr = rec.putArray("assists");
+                assists.forEach(arr::add);
+            }
+        }
+        combatLogWriter.write(rec);
+        combatLogCount++;
+    }
+
+    @OnTickEnd
+    protected void onTickEnd(boolean synthetic) {
+        if (synthetic) {
+            return;
+        }
+        lastTick = ctx.getTick();
+        applyPendingHeroAssignments();
+        if (!initialSampleWritten) {
+            writePlayerStates(0.0f, lastTick);
+            initialSampleWritten = true;
+        }
+        if (currentGameTime > 0) {
+            if (Float.isNaN(nextSampleAt)) {
+                nextSampleAt = Math.max(1.0f, currentGameTime);
+            }
+            int guard = 0;
+            while (currentGameTime >= nextSampleAt && guard < 8) {
+                writePlayerStates(nextSampleAt, lastTick);
+                nextSampleAt += sampleIntervalSec;
+                guard++;
+            }
+        }
+    }
+
+    private void applyPendingHeroAssignments() {
+        for (int p = 0; p < 10; p++) {
+            int handle = pendingHeroHandles[p];
+            if (handle == 0) {
+                continue;
+            }
+            pendingHeroHandles[p] = 0;
+            if (handle > 0) {
+                Entity hero = entities.getByHandle(handle);
+                if (hero != null) {
+                    players[p].assignHero(hero);
+                }
+            }
+        }
+    }
+
+    private void writePlayerStates(float gameTime, int tick) {
+        ensureEntities();
+        for (int p = 0; p < 10; p++) {
+            PlayerLookup lookup = players[p];
+            ObjectNode rec = playersWriter.newRecord();
+            rec.put("t", round1(gameTime));
+            rec.put("tick", tick);
+            rec.put("player", p);
+            Integer team = intOrNull(playerResourceEntity, lookup.teamPath);
+            put(rec, "team", team);
+            put(rec, "name", strOrNull(playerResourceEntity, lookup.namePath));
+            put(rec, "hero", lookup.heroName());
+            put(rec, "level", intOrNull(playerResourceEntity, lookup.levelPath));
+            put(rec, "kills", intOrNull(playerResourceEntity, lookup.killsPath));
+            put(rec, "deaths", intOrNull(playerResourceEntity, lookup.deathsPath));
+            put(rec, "assists", intOrNull(playerResourceEntity, lookup.assistsPath));
+
+            int pos = team == null ? -1 : teamPos(p, team);
+            DataLookup data = team != null && team == 2 ? radiantData : (team != null && team == 3 ? direData : null);
+            if (data != null && pos >= 0) {
+                put(rec, "total_earned_gold", intOrNull(null, data.totalEarnedGold[pos]));
+                put(rec, "last_hits", intOrNull(null, data.lastHits[pos]));
+                put(rec, "denies", intOrNull(null, data.denies[pos]));
+            }
+
+            Entity hero = lookup.heroEntity;
+            if (hero != null) {
+                float[] position = lookup.position();
+                if (position != null) {
+                    rec.put("x", round1(position[0]));
+                    rec.put("y", round1(position[1]));
+                    rec.put("z", round1(position[2]));
+                }
+                put(rec, "hp", floatOrNull(hero, lookup.fpHp));
+                put(rec, "max_hp", floatOrNull(hero, lookup.fpMaxHp));
+                put(rec, "mana", floatOrNull(hero, lookup.fpMana));
+                put(rec, "max_mana", floatOrNull(hero, lookup.fpMaxMana));
+
+                String[] items = lookup.items();
+                if (items != null) {
+                    ObjectNode itemArr = rec.putObject("items");
+                    for (int slot = 0; slot < items.length; slot++) {
+                        if (items[slot] != null) {
+                            itemArr.put("slot" + slot, items[slot]);
+                        }
+                    }
+                }
+            }
+            playersWriter.write(rec);
+        }
+    }
+
+    private void ensureEntities() {
+        if (playerResourceEntity == null) {
+            playerResourceEntity = entities.getByDtName((s2 ? "CDOTA_" : "DT_DOTA_") + "PlayerResource");
+        }
+        if (radiantData == null) {
+            radiantData = DataLookup.tryCreate(entities.getByDtName((s2 ? "CDOTA_" : "DT_DOTA_") + "DataRadiant"));
+            direData = DataLookup.tryCreate(entities.getByDtName((s2 ? "CDOTA_" : "DT_DOTA_") + "DataDire"));
+        }
+    }
+
+    /** Position of the player within its team's Data entity (0-4), or -1 when unknown. */
+    private int teamPos(int playerIdx, int team) {
+        if (team != 2 && team != 3) {
+            return -1;
+        }
+        int pos = 0;
+        for (int p = 0; p < playerIdx; p++) {
+            Integer t = intOrNull(playerResourceEntity, players[p].teamPath);
+            if (t != null && t == team) {
+                pos++;
+            }
+        }
+        return pos < 5 ? pos : -1;
+    }
+
+    public int lastTick() {
+        return lastTick;
+    }
+
+    public long combatLogCount() {
+        return combatLogCount;
+    }
+
+    // ------------------------------------------------------------------
+    // helpers
+    // ------------------------------------------------------------------
+
+    private static DOTACombatLog.DOTA_COMBATLOG_TYPES safeType(CombatLogEntry cle) {
+        try {
+            return cle.getType();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    private static void put(ObjectNode node, String field, Object value) {
+        if (value == null) {
+            return;
+        }
+        if (value instanceof Integer i) {
+            node.put(field, i);
+        } else if (value instanceof Long l) {
+            node.put(field, l);
+        } else if (value instanceof Float f) {
+            node.put(field, f);
+        } else if (value instanceof Double d) {
+            node.put(field, d);
+        } else if (value instanceof Boolean b) {
+            node.put(field, b);
+        } else {
+            node.put(field, value.toString());
+        }
+    }
+
+    private static Object num(int v) {
+        return v == 0 ? null : v;
+    }
+
+    private static Object num(float v) {
+        return v == 0 ? null : v;
+    }
+
+    private static String str(String s) {
+        return (s == null || s.isEmpty()) ? null : s;
+    }
+
+    private static float round1(float v) {
+        return Math.round(v * 10.0f) / 10.0f;
+    }
+
+    private static Integer intOrNull(Entity e, FieldPath fp) {
+        if (fp == null) {
+            return null;
+        }
+        try {
+            Object v = e == null ? null : e.getPropertyForFieldPath(fp);
+            if (v instanceof Number n) {
+                return n.intValue();
+            }
+            return null;
+        } catch (RuntimeException ex) {
+            return null;
+        }
+    }
+
+    private static Float floatOrNull(Entity e, FieldPath fp) {
+        if (fp == null) {
+            return null;
+        }
+        try {
+            Object v = e.getPropertyForFieldPath(fp);
+            if (v instanceof Number n) {
+                return n.floatValue();
+            }
+            return null;
+        } catch (RuntimeException ex) {
+            return null;
+        }
+    }
+
+    private static String strOrNull(Entity e, FieldPath fp) {
+        if (fp == null) {
+            return null;
+        }
+        try {
+            Object v = e.getPropertyForFieldPath(fp);
+            return v instanceof String s && !s.isEmpty() ? s : null;
+        } catch (RuntimeException ex) {
+            return null;
+        }
+    }
+
+    private static FieldPath fp(DTClass dt, String name) {
+        try {
+            return dt.getFieldPathForName(name);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** Source 2 cell+vec decomposition: world coord = (cell - 128) * 128 + vec.
+     *  The world origin (0,0) sits at cell 128, so 128 cells (16384 units) must be
+     *  subtracted; without it the fountain reads +9600 instead of -6700. */
+    public static float positionComponent(int cell, float vec) {
+        return (cell - 128) * 128.0f + vec;
+    }
+
+    public static String heroNameFromClass(String dtName) {
+        for (String prefix : HERO_PREFIX_S2) {
+            if (dtName.startsWith(prefix)) {
+                return dtName.substring(prefix.length());
+            }
+        }
+        for (String prefix : HERO_PREFIX_S1) {
+            if (dtName.startsWith(prefix)) {
+                return dtName.substring(prefix.length());
+            }
+        }
+        return dtName;
+    }
+
+    // ------------------------------------------------------------------
+    // player resource lookup
+    // ------------------------------------------------------------------
+
+    private final class PlayerLookup {
+        final FieldPath teamPath;
+        final FieldPath namePath;
+        final FieldPath levelPath;
+        final FieldPath killsPath;
+        final FieldPath deathsPath;
+        final FieldPath assistsPath;
+        final FieldPath selectedHeroPath;
+
+        Entity heroEntity;
+        private DTClass heroClass;
+        private FieldPath fpCellX, fpCellY, fpCellZ, fpVecX, fpVecY, fpVecZ;
+        private FieldPath fpHp, fpMaxHp, fpMana, fpMaxMana;
+        private final FieldPath[] itemPaths = new FieldPath[ITEM_SLOTS];
+        private String cachedHeroName;
+
+        PlayerLookup(DTClass prClass, int idx, boolean legacy) {
+            String a = Util.arrayIdxToString(idx);
+            if (legacy) {
+                teamPath = fp(prClass, "m_iPlayerTeams." + a);
+                namePath = fp(prClass, "m_iszPlayerNames." + a);
+                levelPath = fp(prClass, "m_iLevel." + a);
+                killsPath = fp(prClass, "m_iKills." + a);
+                deathsPath = fp(prClass, "m_iDeaths." + a);
+                assistsPath = fp(prClass, "m_iAssists." + a);
+                selectedHeroPath = null;
+            } else {
+                teamPath = fp(prClass, "m_vecPlayerData." + a + ".m_iPlayerTeam");
+                namePath = fp(prClass, "m_vecPlayerData." + a + ".m_iszPlayerName");
+                levelPath = fp(prClass, "m_vecPlayerTeamData." + a + ".m_iLevel");
+                killsPath = fp(prClass, "m_vecPlayerTeamData." + a + ".m_iKills");
+                deathsPath = fp(prClass, "m_vecPlayerTeamData." + a + ".m_iDeaths");
+                assistsPath = fp(prClass, "m_vecPlayerTeamData." + a + ".m_iAssists");
+                selectedHeroPath = fp(prClass, "m_vecPlayerTeamData." + a + ".m_hSelectedHero");
+            }
+        }
+
+        boolean containsAny(FieldPath[] changed, int n, FieldPath fp) {
+            for (int i = 0; i < n; i++) {
+                if (changed[i].equals(fp)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void assignHero(Entity hero) {
+            heroEntity = hero;
+            heroClass = hero.getDtClass();
+            String body = "CBodyComponent.m_";
+            fpCellX = fp(heroClass, body + "cellX");
+            fpCellY = fp(heroClass, body + "cellY");
+            fpCellZ = fp(heroClass, body + "cellZ");
+            fpVecX = fp(heroClass, body + "vecX");
+            fpVecY = fp(heroClass, body + "vecY");
+            fpVecZ = fp(heroClass, body + "vecZ");
+            fpHp = fp(heroClass, "m_iHealth");
+            fpMaxHp = fp(heroClass, "m_iMaxHealth");
+            fpMana = fp(heroClass, "m_flMana");
+            fpMaxMana = fp(heroClass, "m_flMaxMana");
+            for (int j = 0; j < itemPaths.length; j++) {
+                itemPaths[j] = fp(heroClass, "m_hItems." + Util.arrayIdxToString(j));
+            }
+            cachedHeroName = heroNameFromClass(heroClass.getDtName());
+        }
+
+        float[] position() {
+            if (heroEntity == null) {
+                return null;
+            }
+            try {
+                boolean hasCell = fpCellX != null && fpVecX != null;
+                Float x = hasCell
+                    ? positionComponent(Objects.requireNonNull(intOrNull(heroEntity, fpCellX)), floatOrNull(heroEntity, fpVecX))
+                    : floatOrNull(heroEntity, fpVecX);
+                Float y = hasCell
+                    ? positionComponent(Objects.requireNonNull(intOrNull(heroEntity, fpCellY)), floatOrNull(heroEntity, fpVecY))
+                    : floatOrNull(heroEntity, fpVecY);
+                Float z = hasCell
+                    ? positionComponent(Objects.requireNonNull(intOrNull(heroEntity, fpCellZ)), floatOrNull(heroEntity, fpVecZ))
+                    : floatOrNull(heroEntity, fpVecZ);
+                if (x == null || y == null || z == null) {
+                    return null;
+                }
+                return new float[]{x, y, z};
+            } catch (RuntimeException e) {
+                return null;
+            }
+        }
+
+        String heroName() {
+            return cachedHeroName;
+        }
+
+        String[] items() {
+            if (heroEntity == null) {
+                return null;
+            }
+            String[] out = new String[itemPaths.length];
+            for (int j = 0; j < itemPaths.length; j++) {
+                FieldPath fp = itemPaths[j];
+                if (fp == null) {
+                    continue;
+                }
+                Integer handle = intOrNull(heroEntity, fp);
+                if (handle == null || handle <= 0) {
+                    continue;
+                }
+                Entity item = entities.getByHandle(handle);
+                if (item == null) {
+                    continue;
+                }
+                out[j] = itemName(item);
+            }
+            return out;
+        }
+
+        private String itemName(Entity item) {
+            String dt = item.getDtClass().getDtName();
+            if (dt.equals("CDOTA_Item") || dt.equals("DT_DOTA_Item")) {
+                return null;
+            }
+            if (dt.startsWith("CDOTA_Item_")) {
+                return "item_" + dt.substring("CDOTA_Item_".length()).toLowerCase();
+            }
+            if (dt.startsWith("DT_DOTA_Item_")) {
+                return "item_" + dt.substring("DT_DOTA_Item_".length()).toLowerCase();
+            }
+            return dt;
+        }
+    }
+
+    private static final class DataLookup {
+        final FieldPath[] totalEarnedGold = new FieldPath[5];
+        final FieldPath[] lastHits = new FieldPath[5];
+        final FieldPath[] denies = new FieldPath[5];
+
+        static DataLookup tryCreate(Entity dataEntity) {
+            DataLookup lk = new DataLookup();
+            if (dataEntity == null) {
+                return lk;
+            }
+            for (int pos = 0; pos < 5; pos++) {
+                String a = Util.arrayIdxToString(pos);
+                lk.totalEarnedGold[pos] = fp(dataEntity.getDtClass(), "m_vecDataTeam." + a + ".m_iTotalEarnedGold");
+                lk.lastHits[pos] = fp(dataEntity.getDtClass(), "m_vecDataTeam." + a + ".m_iLastHitCount");
+                lk.denies[pos] = fp(dataEntity.getDtClass(), "m_vecDataTeam." + a + ".m_iDenyCount");
+            }
+            return lk;
+        }
+    }
+}
