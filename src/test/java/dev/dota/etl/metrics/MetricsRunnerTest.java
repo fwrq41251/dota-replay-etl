@@ -101,6 +101,30 @@ class MetricsRunnerTest {
     }
 
     @Test
+    void teamKillsUseAttackerTeam() throws Exception {
+        Path combat = dir.resolve("combatlog.ndjson");
+        Path players = dir.resolve("players.ndjson");
+        Files.write(combat, List.of(
+            // pudge (team 2) kills axe (team 3) twice, axe kills pudge once
+            "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"attacker_team\":2,\"target_team\":3,\"value\":300,\"x\":1.0,\"y\":2.0,\"networth\":1200,\"assists\":[0]}",
+            "{\"t\":101.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"attacker_team\":2,\"target_team\":3,\"value\":300,\"x\":1.0,\"y\":2.0}",
+            "{\"t\":102.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_axe\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_pudge\",\"target_hero\":true,\"attacker_team\":3,\"target_team\":2,\"value\":300,\"x\":1.0,\"y\":2.0}",
+            "{\"t\":103.0,\"type\":\"DOTA_COMBATLOG_PURCHASE\",\"target\":\"npc_dota_hero_pudge\",\"target_key\":\"pudge\",\"value_name\":\"item_blinkdagger\"}"
+        ));
+        Files.write(players, List.of(
+            "{\"t\":0.0,\"tick\":0,\"player\":0,\"team\":2,\"name\":\"alice\",\"hero\":\"Pudge\",\"level\":5,\"kills\":2,\"deaths\":1,\"assists\":3,\"x\":100.0,\"y\":100.0,\"z\":64.0,\"hp\":1000.0,\"max_hp\":1000.0}",
+            "{\"t\":0.0,\"tick\":0,\"player\":1,\"team\":3,\"name\":\"bob\",\"hero\":\"Axe\",\"level\":4,\"kills\":1,\"deaths\":2,\"assists\":1,\"x\":-100.0,\"y\":-100.0,\"z\":64.0,\"hp\":900.0,\"max_hp\":900.0}"));
+
+        ObjectNode m = new MetricsRunner(combat, players).run();
+        var kills = m.path("summary").path("team_kills");
+        // team_kills must count kills BY each team (attacker), not deaths (victim)
+        assertEquals(2, kills.get(0).path("kills").asLong());
+        assertEquals(1, kills.get(1).path("kills").asLong());
+        assertEquals("radiant", kills.get(0).path("side").asText());
+        assertEquals("dire", kills.get(1).path("side").asText());
+    }
+
+    @Test
     void computesCurvesAndItems() throws Exception {
         ObjectNode m = runMetrics();
         assertTrue(m.path("gold_curves").size() >= 1);

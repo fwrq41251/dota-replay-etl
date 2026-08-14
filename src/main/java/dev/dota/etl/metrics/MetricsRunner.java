@@ -97,9 +97,9 @@ public final class MetricsRunner {
             s.put("duration_sec", round1(end - start));
         });
         ArrayNode teamKills = s.putArray("team_kills");
-        queryMaps(conn, "SELECT target_team team, COUNT(*) kills FROM combatlog_v " +
-            "WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero AND target_team IS NOT NULL " +
-            "GROUP BY target_team ORDER BY target_team")
+        queryMaps(conn, "SELECT attacker_team team, COUNT(*) kills FROM combatlog_v " +
+            "WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero AND attacker_team IS NOT NULL " +
+            "GROUP BY attacker_team ORDER BY attacker_team")
             .forEach(row -> {
                 ObjectNode t = teamKills.addObject();
                 int team = intOf(row.get("team"));
