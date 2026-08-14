@@ -21,6 +21,9 @@ public final class ReportGenerator {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    /** Economy tables/highlights start here (t = 13 min is roughly game start / horn). */
+    private static final int GAME_START_MINUTE = 13;
+
     private static final String[] KEY_ITEMS = {
         "item_blinkdagger", "item_black_king_bar", "item_aghanims_scepter", "item_aghanims_shard",
         "item_refresher", "item_sheepstick", "item_skadi", "item_monkey_king_bar", "item_bloodthorn",
@@ -157,24 +160,32 @@ public final class ReportGenerator {
                 }
             }
             long lead = teamSum[0] - teamSum[1];
-            if (lead > maxLead) {
-                maxLead = lead;
-                maxLeadMin = min;
-            }
-            if (lead < maxDeficit) {
-                maxDeficit = lead;
-                maxDeficitMin = min;
-            }
-            if (min >= 13) { // skip pre-game minutes (all zero)
+            if (min >= GAME_START_MINUTE) { // ignore pre-horn minutes that are all ~zero
+                if (lead > maxLead) {
+                    maxLead = lead;
+                    maxLeadMin = min;
+                }
+                if (lead < maxDeficit) {
+                    maxDeficit = lead;
+                    maxDeficitMin = min;
+                }
                 sb.append('|').append(min).append('|')
                   .append(lead > 0 ? "+" + lead : String.valueOf(lead)).append("|\n");
             }
         }
         sb.append('\n');
-        sb.append("天辉经济最大领先 +").append(maxLead)
-          .append("（约第 ").append(maxLeadMin).append(" 分钟）；");
-        sb.append("天辉经济最大落后 ").append(maxDeficit)
-          .append("（约第 ").append(maxDeficitMin).append(" 分钟）。\n\n");
+        if (maxLead > 0) {
+            sb.append("天辉经济最大领先 +").append(maxLead)
+              .append("（约第 ").append(maxLeadMin).append(" 分钟）");
+        }
+        if (maxDeficit < 0) {
+            if (maxLead > 0) {
+                sb.append('；');
+            }
+            sb.append("天辉经济最大落后 ").append(maxDeficit)
+              .append("（约第 ").append(maxDeficitMin).append(" 分钟）");
+        }
+        sb.append("。\n\n");
     }
 
     private static double lastAtOrBefore(List<double[]> pts, double t) {

@@ -3,9 +3,11 @@ package dev.dota.etl.download;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream;
+import org.apache.commons.compress.compressors.zstandard.ZstdCompressorInputStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -35,6 +37,8 @@ public final class ReplayDownloader {
         "https://api.steampowered.com/IDOTA2Match_570/GetReplayInfo/v1";
     private static final String OPEN_DOTA_MATCH_API =
         "https://api.opendota.com/api/matches/";
+    private static final String OPEN_DOTA_REQUEST_API =
+        "https://api.opendota.com/api/request/";
     private static final String CDN_TEMPLATE =
         "http://replay%d.valve.net/570/%d_%d.dem.bz2";
 
@@ -118,6 +122,35 @@ public final class ReplayDownloader {
     }
 
     private ReplayInfo resolveViaOpenDota(long matchId) throws IOException, InterruptedException {
+        ReplayInfo info = openDotaReplayInfo(matchId);
+        if (info != null) {
+            return info;
+        }
+        // Very recent matches are often not parsed yet; ask OpenDota to parse and poll.
+        log.info("OpenDota has no replay_salt/cluster for match {} yet; requesting a parse and polling...", matchId);
+        HttpRequest req = HttpRequest.newBuilder(URI.create(OPEN_DOTA_REQUEST_API + matchId))
+            .timeout(Duration.ofSeconds(30))
+            .POST(HttpRequest.BodyPublishers.noBody())
+            .build();
+        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            log.warn("OpenDota parse request returned HTTP {} (continuing to poll anyway)", resp.statusCode());
+        }
+        for (int i = 1; i <= 8; i++) {
+            Thread.sleep(15000);
+            info = openDotaReplayInfo(matchId);
+            if (info != null) {
+                log.info("OpenDota finished parsing match {} after poll {}", matchId, i);
+                return info;
+            }
+            log.info("parse not ready yet (poll {}/8), waiting...", i);
+        }
+        throw new IOException("OpenDota still has no replay_salt/cluster for match " + matchId
+            + " after requesting a parse");
+    }
+
+    /** Returns replay info, or null when OpenDota hasn't parsed the match yet. */
+    private ReplayInfo openDotaReplayInfo(long matchId) throws IOException, InterruptedException {
         HttpRequest req = HttpRequest.newBuilder(URI.create(OPEN_DOTA_MATCH_API + matchId))
             .timeout(Duration.ofSeconds(30))
             .GET()
@@ -130,20 +163,42 @@ public final class ReplayDownloader {
         long salt = root.path("replay_salt").asLong();
         long cluster = root.path("cluster").asLong();
         if (salt == 0 || cluster == 0) {
-            throw new IOException("OpenDota returned no replay_salt/cluster for match " + matchId);
+            return null;
         }
         return new ReplayInfo(salt, cluster, null);
     }
 
-    private static void decompress(Path bz2, Path dem) throws IOException {
-        try (InputStream in = new BZip2CompressorInputStream(Files.newInputStream(bz2));
-             OutputStream out = Files.newOutputStream(dem, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+    static void decompress(Path compressed, Path dem) throws IOException {
+        byte[] magic;
+        try (InputStream f = Files.newInputStream(compressed)) {
+            magic = f.readNBytes(4);
+        }
+        boolean isBzip2 = magic.length >= 3 && magic[0] == 'B' && magic[1] == 'Z' && magic[2] == 'h';
+        boolean isZstd = magic.length >= 4 && magic[0] == 0x28 && magic[1] == (byte) 0xB5
+            && magic[2] == 0x2F && magic[3] == (byte) 0xFD;
+        if (!isBzip2 && !isZstd) {
+            throw new IOException("replay download is neither BZip2 nor Zstandard "
+                + "(magic: " + hex(magic) + "); the CDN may have served an error page");
+        }
+        try (InputStream in = isBzip2
+                ? new BZip2CompressorInputStream(Files.newInputStream(compressed))
+                : new ZstdCompressorInputStream(Files.newInputStream(compressed));
+             OutputStream out = Files.newOutputStream(dem,
+                     StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
             byte[] buf = new byte[1 << 16];
             int n;
             while ((n = in.read(buf)) != -1) {
                 out.write(buf, 0, n);
             }
         }
+    }
+
+    private static String hex(byte[] b) {
+        StringBuilder sb = new StringBuilder();
+        for (byte x : b) {
+            sb.append(String.format("%02x ", x & 0xff));
+        }
+        return sb.toString().trim();
     }
 
     private record ReplayInfo(long replaySalt, long cluster, String replayUrl) {

@@ -44,9 +44,12 @@ java -jar target/dota-replay-etl-0.1.0-SNAPSHOT.jar report out/6676393091
 ### Replay download
 
 Replay download does **not** require a Steam API key. The match's `replay_salt` and `cluster`
-are resolved through the public OpenDota API (`/api/matches/{id}`), and the `.dem.bz2` is pulled
-from `http://replay<cluster>.valve.net/570/<matchId>_<salt>.dem.bz2`. If `STEAM_API_KEY` is set,
-resolution goes through the official `GetReplayInfo` endpoint instead.
+are resolved through the public OpenDota API (`/api/matches/{id}`); for very recent matches
+OpenDota often hasn't parsed them yet, in which case the tool requests a parse and polls until
+`salt`/`cluster` appear. The replay is pulled from
+`http://replay<cluster>.valve.net/570/<matchId>_<salt>.dem.bz2` and decompressed by sniffing the
+magic bytes: classic replays are BZip2, newer ones are Zstandard (both supported). If
+`STEAM_API_KEY` is set, resolution goes through the official `GetReplayInfo` endpoint instead.
 
 Downloaded replays are cached under `--cache` (default `replays/`) and reused if present.
 
