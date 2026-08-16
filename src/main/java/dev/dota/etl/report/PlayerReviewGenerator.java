@@ -22,13 +22,11 @@ public final class PlayerReviewGenerator {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** Economy tables start here (t = 13 min is roughly game start / horn). */
-    private static final int GAME_START_MINUTE = 13;
-
     private final Path matchDir;
     private final Path metricsJson;
     private final Path matchJson;
     private final Path playersJson;
+    private final Path combatLogJson;
     private final String selector;
     private Path outFile;
 
@@ -37,6 +35,7 @@ public final class PlayerReviewGenerator {
         this.metricsJson = matchDir.resolve("metrics.json");
         this.matchJson = matchDir.resolve("match.json");
         this.playersJson = matchDir.resolve("players.ndjson");
+        this.combatLogJson = matchDir.resolve("combatlog.ndjson");
         this.selector = selector;
     }
 
@@ -64,13 +63,15 @@ public final class PlayerReviewGenerator {
            .append("做一份客观、有洞察的中文复盘（markdown，含清晰章节）。\n")
            .append("要求：\n")
            .append("1. 所有数字只能引用下面给出的数据，**不得自行推算或编造**；\n")
-           .append("2. 时间为游戏内秒数（约 800 秒 = 比赛开始/出兵，相当于游戏时钟 0 分）；\n")
+           .append("2. 时间均为从开局号角起算的正式游戏时钟，负数表示号角前；\n")
            .append("3. 重点分析四个维度：**出装决策、团战切入、打钱路线、关键决策**；\n")
-           .append("4. 每个结论必须引用数据支撑，最后给出按收益排序的改进清单。\n\n");
+           .append("4. 每个结论必须引用数据支撑，最后给出按收益排序的改进清单；\n")
+           .append("5. 明确区分【事实】与【推断】。不得仅凭 KDA 判断操作；没有技能、位置或视野证据时必须写“无法判断”。\n\n");
 
         appendProfile(sb, metrics, match, target);
         appendItems(sb, metrics, heroKey);
         appendKillsDeaths(sb, metrics, heroKey);
+        appendDeathWindows(sb, metrics, heroKey);
         appendEconomy(sb, metrics, heroKey);
         appendDamage(sb, metrics, heroKey);
         appendTeamfights(sb, metrics, heroKey);
@@ -103,14 +104,19 @@ public final class PlayerReviewGenerator {
                 opp = t.path("kills").asLong();
             }
         }
-        sb.append("- 团队结果：本队英雄击杀 ").append(my).append(" : ").append(opp)
-          .append(my > opp ? "（胜）" : "（负）").append("\n\n");
+        int winner = m.path("summary").path("winner_team").asInt(0);
+        sb.append("- 团队比分：本队英雄击杀 ").append(my).append(" : ").append(opp).append('\n');
+        sb.append("- 团队结果：")
+          .append(winner == 2 || winner == 3
+              ? (winner == p.path("team").asInt() ? "胜" : "负")
+              : "未知（不得由比分推断）")
+          .append("\n\n");
     }
 
     private void appendItems(StringBuilder sb, JsonNode m, String heroKey) {
         sb.append("## 装备时间线\n\n");
         sb.append("（首次购买时间；装备名称为内部 ID）\n\n");
-        sb.append("| 时间(秒) | 装备 |\n|---|---|\n");
+        sb.append("| 游戏时间 | 装备 |\n|---|---|\n");
         boolean any = false;
         for (JsonNode t : m.path("item_timeline")) {
             if (!t.path("hero").asText().equals(heroKey)) {
@@ -121,7 +127,7 @@ public final class PlayerReviewGenerator {
             items.sort((a, b) -> Double.compare(a.path("t").asDouble(), b.path("t").asDouble()));
             for (JsonNode it : items) {
                 any = true;
-                sb.append('|').append(ReportGenerator.fmt(it.path("t").asDouble()))
+                sb.append('|').append(ReportGenerator.gameTime(it.path("t").asDouble()))
                   .append('|').append(it.path("item").asText().replaceFirst("^item_", "")).append("|\n");
             }
         }
@@ -144,29 +150,29 @@ public final class PlayerReviewGenerator {
         }
         sb.append("## 击杀与阵亡\n\n");
         sb.append("### 击杀（").append(myKills.size()).append(" 个）\n\n");
-        sb.append("| 时间(秒) | 击杀对象 | 位置 |\n|---|---|---|\n");
+        sb.append("| 游戏时间 | 击杀对象 | 位置 |\n|---|---|---|\n");
         for (JsonNode k : myKills) {
             appendKillRow(sb, k, k.path("victim"));
         }
         sb.append("\n### 阵亡（").append(myDeaths.size()).append(" 次）\n\n");
-        sb.append("| 时间(秒) | 击杀者 | 位置 |\n|---|---|---|\n");
+        sb.append("| 游戏时间 | 击杀者 | 位置 |\n|---|---|---|\n");
         for (JsonNode k : myDeaths) {
             appendKillRow(sb, k, k.path("killer"));
         }
         sb.append('\n');
         if (!myKills.isEmpty()) {
             double last = myKills.get(myKills.size() - 1).path("t").asDouble();
-            sb.append("**事实提取**：最后一次击杀在 ").append(ReportGenerator.fmt(last)).append(" 秒。\n");
+            sb.append("**事实提取**：最后一次击杀在 ").append(ReportGenerator.gameTime(last)).append("。\n");
         }
         if (!myDeaths.isEmpty()) {
             double last = myDeaths.get(myDeaths.size() - 1).path("t").asDouble();
-            sb.append("**事实提取**：最后一次阵亡在 ").append(ReportGenerator.fmt(last)).append(" 秒。\n");
+            sb.append("**事实提取**：最后一次阵亡在 ").append(ReportGenerator.gameTime(last)).append("。\n");
         }
         sb.append('\n');
     }
 
     private static void appendKillRow(StringBuilder sb, JsonNode k, JsonNode hero) {
-        sb.append('|').append(ReportGenerator.fmt(k.path("t").asDouble()))
+        sb.append('|').append(ReportGenerator.gameTime(k.path("t").asDouble()))
           .append('|').append(ReportGenerator.heroShort(hero.asText(""))).append('|');
         JsonNode loc = k.path("location");
         if (loc.isArray() && loc.size() == 2) {
@@ -176,6 +182,106 @@ public final class PlayerReviewGenerator {
             sb.append('-');
         }
         sb.append("|\n");
+    }
+
+    private void appendDeathWindows(StringBuilder sb, JsonNode metrics, String heroKey) throws Exception {
+        if (!Files.exists(combatLogJson)) {
+            return;
+        }
+        String hero = "npc_dota_hero_" + heroKey;
+        List<JsonNode> events = new ArrayList<>();
+        try (BufferedReader br = Files.newBufferedReader(combatLogJson)) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.isBlank()) {
+                    continue;
+                }
+                JsonNode event = MAPPER.readTree(line);
+                if (hero.equals(event.path("attacker").asText()) || hero.equals(event.path("target").asText())) {
+                    events.add(event);
+                }
+            }
+        }
+        List<JsonNode> deaths = new ArrayList<>();
+        for (JsonNode kill : metrics.path("kills")) {
+            if (heroKey.equals(kill.path("victim_key").asText())) {
+                deaths.add(kill);
+            }
+        }
+        if (deaths.isEmpty()) {
+            return;
+        }
+
+        sb.append("## 阵亡前 15 秒事件证据\n\n");
+        sb.append("以下是确定性事件，不包含视野、鼠标操作和技能冷却推断。")
+          .append("“上次 BKB”只表示最近一次使用时间，是否已冷却需结合版本与使用间隔判断。\n\n");
+        for (JsonNode death : deaths) {
+            double deathRaw = death.path("raw_t").asDouble(death.path("t").asDouble()
+                + metrics.path("summary").path("raw_time_offset_sec").asDouble(0));
+            double from = deathRaw - 15;
+            List<String> casts = new ArrayList<>();
+            List<String> controls = new ArrayList<>();
+            Map<String, Long> incoming = new LinkedHashMap<>();
+            double firstHp = -1;
+            double lastBkb = Double.NaN;
+            for (JsonNode event : events) {
+                double t = event.path("t").asDouble();
+                String type = event.path("type").asText();
+                String attacker = event.path("attacker").asText();
+                String target = event.path("target").asText();
+                String inflictor = event.path("inflictor").asText("unknown").replaceFirst("^item_", "");
+                if (t <= deathRaw && hero.equals(attacker)
+                    && "DOTA_COMBATLOG_ITEM".equals(type) && "black_king_bar".equals(inflictor)) {
+                    lastBkb = t;
+                }
+                if (t < from || t > deathRaw) {
+                    continue;
+                }
+                String before = String.format("-%.1fs ", deathRaw - t);
+                if (hero.equals(attacker)
+                    && ("DOTA_COMBATLOG_ABILITY".equals(type) || "DOTA_COMBATLOG_ITEM".equals(type))
+                    && !"power_treads".equals(inflictor)) {
+                    casts.add(before + inflictor);
+                }
+                if (hero.equals(target) && "DOTA_COMBATLOG_MODIFIER_ADD".equals(type)
+                    && isControlModifier(inflictor)) {
+                    controls.add(before + inflictor.replaceFirst("^modifier_", "")
+                        + "（" + ReportGenerator.heroShort(attacker) + "）");
+                }
+                if (hero.equals(target) && "DOTA_COMBATLOG_DAMAGE".equals(type)) {
+                    long value = event.path("value").asLong(0);
+                    incoming.merge(ReportGenerator.heroShort(attacker), value, Long::sum);
+                    if (firstHp < 0 && event.has("health")) {
+                        firstHp = event.path("health").asDouble() + value;
+                    }
+                }
+            }
+            sb.append("### ").append(ReportGenerator.gameTime(death.path("t").asDouble()))
+              .append("，被 ").append(ReportGenerator.heroShort(death.path("killer").asText())).append(" 击杀\n\n");
+            if (firstHp >= 0) {
+                sb.append("- 窗口内首次伤害前生命：约 ").append(Math.round(firstHp)).append(" → 0\n");
+            }
+            sb.append("- 主动技能/道具：").append(casts.isEmpty() ? "无记录" : String.join("；", casts)).append('\n');
+            sb.append("- 受到控制：").append(controls.isEmpty() ? "无明确控制记录" : String.join("；", controls)).append('\n');
+            sb.append("- 伤害来源：");
+            if (incoming.isEmpty()) {
+                sb.append("无记录");
+            } else {
+                incoming.entrySet().stream().sorted((a, b) -> Long.compare(b.getValue(), a.getValue()))
+                  .forEach(e -> sb.append(e.getKey()).append(' ').append(e.getValue()).append("；"));
+                sb.setLength(sb.length() - 1);
+            }
+            sb.append('\n');
+            sb.append("- 上次 BKB 使用：")
+              .append(Double.isNaN(lastBkb) ? "此前无记录" : ReportGenerator.fmt(deathRaw - lastBkb) + " 秒前")
+              .append("\n\n");
+        }
+    }
+
+    private static boolean isControlModifier(String name) {
+        return name.contains("stun") || name.contains("silence") || name.contains("root")
+            || name.contains("ensare") || name.contains("orchid") || name.contains("harpoon")
+            || name.contains("slow") || name.contains("hex") || name.contains("bash");
     }
 
     private void appendEconomy(StringBuilder sb, JsonNode m, String heroKey) {
@@ -211,22 +317,24 @@ public final class PlayerReviewGenerator {
         sb.append("| 分钟 | ").append(heroKey).append(" | ").append(enemyTop == null ? "-" : enemyTop).append(" |\n|---|---|---|\n");
         double lastT = mine.get(mine.size() - 1)[0];
         Integer overtakeMin = null;
-        for (int min = GAME_START_MINUTE; min * 60.0 <= lastT + 60; min++) {
+        for (int min = 0; min * 60.0 <= lastT + 60; min++) {
             double t = min * 60.0;
             double v = lastAtOrBefore(mine, t);
             double ev = enemyTop == null ? 0 : lastAtOrBefore(cum.get(enemyTop), t);
             if (overtakeMin == null && enemyTop != null && ev > v) {
                 overtakeMin = min;
             }
-            sb.append('|').append(min).append('|').append((long) v).append('|').append((long) ev).append("|\n");
+            if (min % 5 == 0 || min * 60.0 >= lastT) {
+                sb.append('|').append(min).append('|').append((long) v).append('|').append((long) ev).append("|\n");
+            }
         }
         sb.append('\n');
         if (overtakeMin != null) {
-            sb.append("**事实提取**：对方头号在约第 ").append(overtakeMin)
-              .append(" 分钟起累计收入反超本选手。\n");
+            sb.append("**事实提取**：对方头号最早在约第 ").append(overtakeMin)
+              .append(" 分钟累计收入高于本选手；之后是否持续领先需看表中走势。\n");
         }
         if (mine.size() >= 2) {
-            double tMin = Math.max(GAME_START_MINUTE * 60.0, lastT - 3 * 60.0);
+            double tMin = Math.max(0, lastT - 3 * 60.0);
             double vStart = lastAtOrBefore(mine, tMin);
             double vEnd = lastAtOrBefore(mine, lastT);
             if (vEnd - vStart < 500) {
@@ -288,19 +396,43 @@ public final class PlayerReviewGenerator {
         fights.sort((a, b) -> Double.compare(a.path("start").asDouble(), b.path("start").asDouble()));
         List<JsonNode> mine = new ArrayList<>();
         for (JsonNode f : fights) {
-            for (JsonNode part : f.path("participants")) {
-                if (part.asText().equals(heroKey)) {
+            JsonNode stats = f.path("player_stats").path(heroKey);
+            if (f.has("player_stats")) {
+                if (stats.path("damage_dealt").asLong() >= 100
+                    || stats.path("damage_taken").asLong() >= 100
+                    || stats.path("kills").asLong() > 0 || stats.path("deaths").asLong() > 0) {
                     mine.add(f);
-                    break;
+                }
+            } else {
+                for (JsonNode part : f.path("participants")) {
+                    if (part.asText().equals(heroKey)) {
+                        mine.add(f);
+                        break;
+                    }
                 }
             }
         }
         if (mine.isEmpty()) {
             return;
         }
-        sb.append("## 本选手参与的团战\n\n");
-        sb.append("（★ = 高伤害关键团战；结果按团战窗口内阵亡换算）\n\n");
-        sb.append("| 开始(秒) | 英雄伤害 | 天辉阵亡 | 夜魇阵亡 | 结果 | 本选手 |\n|---|---|---|---|---|---|\n");
+        List<JsonNode> topDamage = new ArrayList<>(mine);
+        topDamage.sort((a, b) -> Long.compare(b.path("hero_damage").asLong(), a.path("hero_damage").asLong()));
+        Map<Integer, Boolean> notableIds = new LinkedHashMap<>();
+        for (int i = 0; i < Math.min(8, topDamage.size()); i++) {
+            notableIds.put(topDamage.get(i).path("id").asInt(), true);
+        }
+        for (JsonNode f : mine) {
+            double start = f.path("start").asDouble();
+            double end = f.path("end").asDouble();
+            if (hasEventInWindow(myKills, start, end) || hasEventInWindow(myDeaths, start, end)) {
+                notableIds.put(f.path("id").asInt(), true);
+            }
+        }
+        mine.removeIf(f -> !notableIds.containsKey(f.path("id").asInt()));
+        sb.append("## 本选手有实质参与的交战窗口\n\n");
+        sb.append("仅展示个人发生击杀/阵亡的窗口，以及全场伤害最高的 8 个本人参与窗口。")
+          .append("参与阈值为个人造成或承受至少 100 点英雄伤害，或发生击杀/阵亡；死亡交换不等同于团战收益。\n\n");
+        sb.append("| 开始 | 全场伤害 | 天辉阵亡 | 夜魇阵亡 | 个人输出/承伤 | 个人击杀/阵亡 |\n|---|---|---|---|---|---|\n");
         List<JsonNode> byDmg = new ArrayList<>(mine);
         byDmg.sort((a, b) -> Double.compare(b.path("hero_damage").asDouble(), a.path("hero_damage").asDouble()));
         Map<String, Boolean> hl = new LinkedHashMap<>();
@@ -312,8 +444,8 @@ public final class PlayerReviewGenerator {
             double end = f.path("end").asDouble();
             int rad = 0;
             int dire = 0;
-            boolean gotKill = false;
-            boolean died = false;
+            long myKillCount = 0;
+            long myDeathCount = 0;
             for (double[] k : kills) {
                 if (k[0] >= start && k[0] <= end) {
                     if (k[1] == 2) {
@@ -325,36 +457,22 @@ public final class PlayerReviewGenerator {
             }
             for (double[] k : myKills) {
                 if (k[0] >= start && k[0] <= end) {
-                    gotKill = true;
+                    myKillCount++;
                 }
             }
             for (double[] k : myDeaths) {
                 if (k[0] >= start && k[0] <= end) {
-                    died = true;
+                    myDeathCount++;
                 }
             }
             sb.append('|').append(hl.containsKey(ReportGenerator.fmt(start)) ? "★" : "")
-              .append(ReportGenerator.fmt(start))
+              .append(ReportGenerator.gameTime(start))
               .append('|').append(f.path("hero_damage").asLong())
               .append('|').append(rad).append('|').append(dire).append('|');
-            if (rad == dire) {
-                sb.append("均势");
-            } else if (rad > dire) {
-                sb.append("夜魇赚");
-            } else {
-                sb.append("天辉赚");
-            }
-            sb.append('|');
-            if (died) {
-                sb.append("阵亡");
-            }
-            if (gotKill) {
-                sb.append(died ? "+击杀" : "击杀");
-            }
-            if (!died && !gotKill) {
-                sb.append("存活未击杀");
-            }
-            sb.append("|\n");
+            JsonNode stats = f.path("player_stats").path(heroKey);
+            sb.append(stats.path("damage_dealt").asLong()).append('/')
+              .append(stats.path("damage_taken").asLong()).append('|')
+              .append(myKillCount).append('/').append(myDeathCount).append("|\n");
         }
         sb.append('\n');
     }
@@ -367,6 +485,7 @@ public final class PlayerReviewGenerator {
         int team = target.path("team").asInt();
         double start = metrics.path("summary").path("game_start_sec").asDouble();
         double end = metrics.path("summary").path("game_end_sec").asDouble();
+        double rawOffset = metrics.path("summary").path("raw_time_offset_sec").asDouble(0);
         double dur = end - start;
         if (dur <= 0) {
             return;
@@ -389,7 +508,7 @@ public final class PlayerReviewGenerator {
                 if (s.path("player").asInt() != player || !s.hasNonNull("x") || !s.hasNonNull("y")) {
                     continue;
                 }
-                double t = s.path("t").asDouble();
+                double t = s.path("t").asDouble() - rawOffset;
                 if (t < start || t > end) {
                     continue;
                 }
@@ -416,7 +535,7 @@ public final class PlayerReviewGenerator {
         sb.append("## 打钱/位置分析\n\n");
         sb.append("坐标说明：正坐标 = 夜魇半场（右上），负坐标 = 天辉半场（左下）；")
            .append("对方半场按河道对角线（x+y=0）划分，深处 = 对方基地方向约 2500 单位以内。\n\n");
-        sb.append("| 阶段 | 时间范围(秒) | 样本数 | 对方半场占比 | 对方深处占比 |\n|---|---|---|---|---|\n");
+        sb.append("| 阶段 | 正式时间范围 | 样本数 | 对方半场占比 | 对方深处占比 |\n|---|---|---|---|---|\n");
         String[] labels = {"前期", "中期", "后期"};
         for (int i = 0; i < 3; i++) {
             if (total[i] == 0) {
@@ -425,7 +544,7 @@ public final class PlayerReviewGenerator {
             double b = start + dur * i / 3.0;
             double e = start + dur * (i + 1) / 3.0;
             sb.append('|').append(labels[i])
-              .append('|').append((long) b).append('-').append((long) e)
+              .append('|').append(ReportGenerator.gameTime(b)).append('-').append(ReportGenerator.gameTime(e))
               .append('|').append(total[i])
               .append('|').append(Math.round(100.0 * enemyHalf[i] / total[i])).append('%')
               .append('|').append(Math.round(100.0 * deep[i] / total[i])).append('%')
@@ -437,10 +556,19 @@ public final class PlayerReviewGenerator {
     private void appendQuestions(StringBuilder sb) {
         sb.append("## 待回答问题（必答）\n\n");
         sb.append("1. **出装决策**：装备节奏是否合理？每件装备的时机与选择（对照装备时间线与经济对比），是否有明显拖延或错误选择？\n");
-        sb.append("2. **团战切入**：结合本选手参与的团战表与每分钟伤害，评价切入时机（先手/收割/观望/白给），关键团是否发挥作用；\n");
+        sb.append("2. **团战切入**：结合个人输出/承伤和阵亡前事件链评价；只有事件证据充分时才能判断先手、收割、过度深入或技能使用问题；\n");
         sb.append("3. **打钱路线**：结合经济对比（是否停滞、何时被反超）与打钱/位置分析（各阶段在对方半场的比例），评价刷钱与地图控制；\n");
-        sb.append("4. **关键决策**：击杀/阵亡时间线与位置揭示了哪些决策模式（单抓、推进、带线、回防）？这些决策是否转化为推塔/肉山/终结？\n");
+        sb.append("4. **关键决策**：只评价数据能够证明的决策；没有建筑、肉山或视野证据时，不得声称某次击杀转化成了推进或控盾；\n");
         sb.append("5. **改进优先级**：给出一条按收益排序的可执行改进清单（每条必须引用上面数据）。\n");
+    }
+
+    private static boolean hasEventInWindow(List<double[]> events, double start, double end) {
+        for (double[] event : events) {
+            if (event[0] >= start && event[0] <= end) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------

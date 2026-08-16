@@ -21,9 +21,6 @@ public final class ReportGenerator {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** Economy tables/highlights start here (t = 13 min is roughly game start / horn). */
-    private static final int GAME_START_MINUTE = 13;
-
     private static final String[] KEY_ITEMS = {
         "item_blinkdagger", "item_black_king_bar", "item_aghanims_scepter", "item_aghanims_shard",
         "item_refresher", "item_sheepstick", "item_skadi", "item_monkey_king_bar", "item_bloodthorn",
@@ -62,8 +59,10 @@ public final class ReportGenerator {
            .append("写一份客观、有洞察的中文复盘报告（markdown，含清晰章节）。\n")
            .append("要求：\n")
            .append("1. 所有数字（比分、时间、经济、团战、装备）只能引用下面给出的数据，**不得自行推算或编造**；\n")
-           .append("2. 时间为游戏内秒数（约 800 秒 = 比赛开始/出兵，相当于游戏时钟 0 分）。\n")
-           .append("3. 结构建议：比赛概览 → 阵容与分路 → 经济走势 → 关键团战 → 选手表现 → 关键转折点与总结。\n\n");
+           .append("2. 时间均为从开局号角起算的正式游戏时钟，负数表示号角前；\n")
+           .append("3. 明确区分【事实】与【推断】；证据不足时写“无法判断”，不得用 KDA 猜测操作、分路或切入质量；\n")
+           .append("4. 结构建议：比赛概览 → 阵容 → 经济走势 → 关键团战 → 选手表现 → 关键转折点与总结。")
+           .append("当前数据不包含可靠分路结果，不得自行推断分路。\n\n");
 
         appendSummary(sb, metrics, match);
         appendRoster(sb, metrics);
@@ -86,14 +85,16 @@ public final class ReportGenerator {
         JsonNode s = m.path("summary");
         sb.append("## 比赛概览\n\n");
         sb.append("- 比赛 ID：").append(match == null ? "?" : match.path("match_id").asText("?")).append('\n');
-        sb.append("- 时长：约 ").append(fmt(s.path("duration_sec").asDouble())).append(" 秒\n");
+        sb.append("- 正式比赛时长：").append(gameTime(s.path("duration_sec").asDouble())).append('\n');
+        int winner = s.path("winner_team").asInt(0);
+        sb.append("- 胜方：").append(winner == 2 || winner == 3 ? side(winner) : "未知（不得由比分推断）").append('\n');
         sb.append("- 比分（只统计英雄击杀）：");
         for (JsonNode t : s.path("team_kills")) {
             sb.append(side(t.path("team").asInt())).append(' ').append(t.path("kills").asLong()).append("  |  ");
         }
         sb.setLength(sb.length() - 5);
         sb.append("\n- 一血：").append(s.path("first_blood").path("victim").asText("?"))
-          .append(" 于 ").append(fmt(s.path("first_blood").path("t").asDouble())).append(" 秒被 ")
+          .append(" 于 ").append(gameTime(s.path("first_blood").path("t").asDouble())).append(" 被 ")
           .append(s.path("first_blood").path("killer").asText("?")).append(" 击杀\n");
         sb.append("- 肉山击杀：").append(s.path("roshan_kills").asLong()).append(" 次\n\n");
     }
@@ -160,7 +161,7 @@ public final class ReportGenerator {
                 }
             }
             long lead = teamSum[0] - teamSum[1];
-            if (min >= GAME_START_MINUTE) { // ignore pre-horn minutes that are all ~zero
+            if (min >= 0) {
                 if (lead > maxLead) {
                     maxLead = lead;
                     maxLeadMin = min;
@@ -169,8 +170,10 @@ public final class ReportGenerator {
                     maxDeficit = lead;
                     maxDeficitMin = min;
                 }
-                sb.append('|').append(min).append('|')
-                  .append(lead > 0 ? "+" + lead : String.valueOf(lead)).append("|\n");
+                if (min % 5 == 0 || min == maxMinute) {
+                    sb.append('|').append(min).append('|')
+                      .append(lead > 0 ? "+" + lead : String.valueOf(lead)).append("|\n");
+                }
             }
         }
         sb.append('\n');
@@ -210,9 +213,9 @@ public final class ReportGenerator {
             return;
         }
         sb.append("## 击杀时间线（全部英雄击杀）\n\n");
-        sb.append("| 时间(秒) | 击杀者 | 被击杀 | 助攻 |\n|---|---|---|---|\n");
+        sb.append("| 游戏时间 | 击杀者 | 被击杀 | 助攻 |\n|---|---|---|---|\n");
         for (JsonNode k : kills) {
-            sb.append('|').append(fmt(k.path("t").asDouble()))
+            sb.append('|').append(gameTime(k.path("t").asDouble()))
               .append('|').append(heroShort(k.path("killer").asText("")))
               .append('|').append(heroShort(k.path("victim").asText("")))
               .append('|');
@@ -237,8 +240,9 @@ public final class ReportGenerator {
                 kills.add(new double[]{t, victimTeam});
             }
         }
-        sb.append("## 团战时间线（共 ").append(fights.size()).append(" 场，★ 为高伤害关键团战）\n\n");
-        sb.append("| 开始(秒) | 持续 | 英雄伤害 | 天辉阵亡 | 夜魇阵亡 | 结果 | 参战英雄 |\n");
+        sb.append("## 交战时间线（共 ").append(fights.size()).append(" 个窗口，★ 为高伤害窗口）\n\n");
+        sb.append("结果只表示窗口内的英雄死亡交换，不包含买活、建筑、肉山和经济收益，不能直接称为“赚”。\n\n");
+        sb.append("| 开始 | 持续 | 英雄伤害 | 天辉阵亡 | 夜魇阵亡 | 死亡交换 | 参战英雄 |\n");
         sb.append("|---|---|---|---|---|---|---|\n");
         List<JsonNode> sorted = new ArrayList<>();
         fights.forEach(sorted::add);
@@ -265,18 +269,18 @@ public final class ReportGenerator {
                 }
             }
             sb.append('|').append(highlight.containsKey(fmt(start)) ? "★" : "")
-              .append(fmt(start))
-              .append('|').append(fmt(end - start))
+              .append(gameTime(start))
+              .append('|').append(gameTime(end - start))
               .append('|').append(f.path("hero_damage").asLong())
               .append('|').append(radDeaths)
               .append('|').append(direDeaths)
               .append('|');
             if (radDeaths == direDeaths) {
-                sb.append("均势");
+                sb.append("阵亡数相同");
             } else if (radDeaths > direDeaths) {
-                sb.append("夜魇赚 (天辉 ").append(radDeaths).append(" 换 ").append(direDeaths).append(')');
+                sb.append("天辉 ").append(radDeaths).append(" / 夜魇 ").append(direDeaths);
             } else {
-                sb.append("天辉赚 (天辉 ").append(radDeaths).append(" 换 ").append(direDeaths).append(')');
+                sb.append("天辉 ").append(radDeaths).append(" / 夜魇 ").append(direDeaths);
             }
             sb.append('|');
             StringBuilder part = new StringBuilder();
@@ -304,7 +308,8 @@ public final class ReportGenerator {
             if (!big.isEmpty()) {
                 sb.append("- ").append(heroShort(t.path("hero").asText(""))).append("：");
                 for (JsonNode it : big) {
-                    sb.append(it.path("item").asText().replaceFirst("^item_", "")).append(' ').append(fmt(it.path("t").asDouble())).append("秒；");
+                    sb.append(it.path("item").asText().replaceFirst("^item_", "")).append(' ')
+                      .append(gameTime(it.path("t").asDouble())).append('；');
                 }
                 sb.setLength(sb.length() - 1);
                 sb.append('\n');
@@ -317,8 +322,9 @@ public final class ReportGenerator {
         sb.append("## 额外要求（必答）\n\n");
         sb.append("请在报告末尾单独给出：\n");
         sb.append("1. **本场 MVP**：写出选手名与英雄，并给出客观理由（引用上面数据，例如 KDA、经济贡献、团战作用、关键装备与胜负团贡献）；\n");
-        sb.append("2. **本场表现最差的选手**：写出选手名与英雄，同样给出基于数据的理由。\n");
-        sb.append("只能从上文阵容表中的选手里选择，理由必须可被上面数据支撑，不要臆测场外因素。\n");
+        sb.append("2. **角色完成度最低的选手（可不选）**：只有证据充分时才选择，并给出数据理由；")
+          .append("证据不足时明确写“不评选”，不得仅凭 KDA 归因。\n");
+        sb.append("只能从上文阵容表中的选手里选择，不要臆测操作细节或场外因素。\n");
     }
 
     // ------------------------------------------------------------------
@@ -343,5 +349,11 @@ public final class ReportGenerator {
 
     static String fmt(double v) {
         return String.format("%.1f", v).replace(".0", "");
+    }
+
+    static String gameTime(double seconds) {
+        boolean negative = seconds < 0;
+        long rounded = Math.round(Math.abs(seconds));
+        return (negative ? "-" : "") + (rounded / 60) + ":" + String.format("%02d", rounded % 60);
     }
 }

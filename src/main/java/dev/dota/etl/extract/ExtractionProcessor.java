@@ -11,6 +11,7 @@ import skadistats.clarity.model.Entity;
 import skadistats.clarity.model.FieldPath;
 import skadistats.clarity.processor.entities.Entities;
 import skadistats.clarity.processor.entities.OnEntityUpdated;
+import skadistats.clarity.processor.entities.OnEntityPropertyChanged;
 import skadistats.clarity.processor.entities.UsesEntities;
 import skadistats.clarity.processor.gameevents.OnCombatLogEntry;
 import skadistats.clarity.processor.reader.OnTickEnd;
@@ -80,6 +81,11 @@ public class ExtractionProcessor {
     private float currentGameTime;
     private float nextSampleAt = Float.NaN;
     private boolean initialSampleWritten;
+    private float gameStartTime;
+    private float gameEndTime;
+    private int gameWinner;
+    private int radiantScore = -1;
+    private int direScore = -1;
 
     public ExtractionProcessor(NdjsonWriter combatLogWriter, NdjsonWriter playersWriter,
                                MatchMeta matchMeta, int sampleIntervalSec) {
@@ -114,6 +120,40 @@ public class ExtractionProcessor {
                 Integer handle = intOrNull(e, lookup.selectedHeroPath);
                 pendingHeroHandles[p] = handle == null ? -1 : handle;
             }
+        }
+    }
+
+    @OnEntityPropertyChanged(
+        classPattern = "CDOTAGamerulesProxy",
+        propertyPattern = "m_pGameRules.m_(flGameStartTime|flGameEndTime|nGameWinner)"
+    )
+    protected void onGameRulesPropertyChanged(Entity e, FieldPath fp) {
+        String name = e.getDtClass().getNameForFieldPath(fp);
+        Object value = e.getPropertyForFieldPath(fp);
+        if (name.endsWith("m_flGameStartTime") && value instanceof Number n && n.floatValue() > 0) {
+            gameStartTime = n.floatValue();
+        } else if (name.endsWith("m_flGameEndTime") && value instanceof Number n && n.floatValue() > 0) {
+            gameEndTime = n.floatValue();
+        } else if (name.endsWith("m_nGameWinner") && value instanceof Number n
+                   && (n.intValue() == 2 || n.intValue() == 3)) {
+            gameWinner = n.intValue();
+        }
+    }
+
+    @OnEntityPropertyChanged(
+        classPattern = "CDOTATeam",
+        propertyPattern = "m_iHeroKills"
+    )
+    protected void onTeamScoreChanged(Entity e, FieldPath fp) {
+        Integer team = propertyInt(e, "m_iTeamNum");
+        Object value = e.getPropertyForFieldPath(fp);
+        if (!(value instanceof Number n)) {
+            return;
+        }
+        if (team != null && team == 2) {
+            radiantScore = n.intValue();
+        } else if (team != null && team == 3) {
+            direScore = n.intValue();
         }
     }
 
@@ -302,6 +342,26 @@ public class ExtractionProcessor {
         return combatLogCount;
     }
 
+    public float gameStartTime() {
+        return gameStartTime;
+    }
+
+    public float gameEndTime() {
+        return gameEndTime;
+    }
+
+    public int gameWinner() {
+        return gameWinner;
+    }
+
+    public int radiantScore() {
+        return radiantScore;
+    }
+
+    public int direScore() {
+        return direScore;
+    }
+
     // ------------------------------------------------------------------
     // helpers
     // ------------------------------------------------------------------
@@ -359,6 +419,15 @@ public class ExtractionProcessor {
                 return n.intValue();
             }
             return null;
+        } catch (RuntimeException ex) {
+            return null;
+        }
+    }
+
+    private static Integer propertyInt(Entity e, String name) {
+        try {
+            Object value = e.hasProperty(name) ? e.getProperty(name) : null;
+            return value instanceof Number n ? n.intValue() : null;
         } catch (RuntimeException ex) {
             return null;
         }

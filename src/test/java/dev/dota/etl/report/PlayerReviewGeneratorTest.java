@@ -95,6 +95,11 @@ class PlayerReviewGeneratorTest {
             "{\"t\":450,\"player\":0,\"x\":2000,\"y\":2000}",
             "{\"t\":550,\"player\":0,\"x\":3000,\"y\":3000}",
             "{\"t\":350,\"player\":1,\"x\":5000,\"y\":5000}") + "\n");
+        Files.writeString(dir.resolve("combatlog.ndjson"), String.join("\n",
+            "{\"t\":195,\"type\":\"DOTA_COMBATLOG_ABILITY\",\"attacker\":\"npc_dota_hero_pudge\",\"target\":\"dota_unknown\",\"inflictor\":\"pudge_meat_hook\"}",
+            "{\"t\":198,\"type\":\"DOTA_COMBATLOG_MODIFIER_ADD\",\"attacker\":\"npc_dota_hero_axe\",\"target\":\"npc_dota_hero_pudge\",\"inflictor\":\"modifier_stunned\"}",
+            "{\"t\":199,\"type\":\"DOTA_COMBATLOG_DAMAGE\",\"attacker\":\"npc_dota_hero_axe\",\"target\":\"npc_dota_hero_pudge\",\"inflictor\":\"axe_culling_blade\",\"value\":500,\"health\":0}",
+            "{\"t\":200,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_axe\",\"target\":\"npc_dota_hero_pudge\"}") + "\n");
         return metricsJson;
     }
 
@@ -108,15 +113,19 @@ class PlayerReviewGeneratorTest {
         assertTrue(prompt.contains("alice"), "player name");
         assertTrue(prompt.contains("天辉"), "side");
         assertTrue(prompt.contains("6/1/5"), "kda");
+        assertTrue(prompt.contains("团队结果：未知（不得由比分推断）"), "does not infer winner from score");
         assertTrue(prompt.contains("blinkdagger"), "item row");
         assertTrue(prompt.contains("击杀（1 个）"), "kill count");
         assertTrue(prompt.contains("阵亡（1 次）"), "death count");
+        assertTrue(prompt.contains("阵亡前 15 秒事件证据"), "death evidence section");
+        assertTrue(prompt.contains("pudge_meat_hook"), "pre-death cast evidence");
+        assertTrue(prompt.contains("stunned（axe）"), "pre-death control evidence");
         assertTrue(prompt.contains("|axe|"), "kill/death victim/killer");
         assertTrue(prompt.contains("经济对比"), "economy section");
-        assertTrue(prompt.contains("|14|1200|1000|"), "economy row value");
+        assertTrue(prompt.contains("|15|2500|1800|"), "economy row value");
         assertTrue(prompt.contains("对英雄总伤害：1000"), "damage total");
-        assertTrue(prompt.contains("团战窗口内阵亡"), "teamfight section");
-        assertTrue(prompt.contains("天辉赚|击杀|"), "teamfight participation cell");
+        assertTrue(prompt.contains("有实质参与的交战窗口"), "teamfight section");
+        assertTrue(prompt.contains("个人输出/承伤"), "personal fight evidence");
         assertTrue(prompt.contains("打钱/位置分析"), "position section");
         assertTrue(prompt.contains("100%"), "enemy half percentage");
         assertTrue(prompt.contains("出装决策"), "question 1");

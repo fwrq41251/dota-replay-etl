@@ -1,9 +1,11 @@
 package dev.dota.etl.metrics;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -55,24 +57,26 @@ public final class MetricsRunner {
 
     public ObjectNode run() throws Exception {
         ObjectNode metrics = MAPPER.createObjectNode();
+        JsonNode match = readMatchJson();
+        double timeOffset = match.path("game_start_time_raw").asDouble(0);
         try (Connection conn = DriverManager.getConnection("jdbc:duckdb:")) {
             conn.createStatement().execute(
                 "CREATE VIEW combatlog AS SELECT * FROM read_ndjson('" + escape(combatLog) + "')");
             conn.createStatement().execute(
                 "CREATE VIEW players AS SELECT * FROM read_ndjson('" + escape(players) + "')");
-            conn.createStatement().execute("""
-                CREATE VIEW combatlog_v AS SELECT *,
+            conn.createStatement().execute(("""
+                CREATE VIEW combatlog_v AS SELECT * EXCLUDE(t), t AS raw_t, t - %f AS t,
                   replace(target, 'npc_dota_hero_', '') AS target_key,
                   replace(attacker, 'npc_dota_hero_', '') AS attacker_key
                 FROM combatlog
-                """);
-            conn.createStatement().execute("""
-                CREATE VIEW players_v AS SELECT *,
+                """).formatted(timeOffset));
+            conn.createStatement().execute(("""
+                CREATE VIEW players_v AS SELECT * EXCLUDE(t), t AS raw_t, t - %f AS t,
                   lower(regexp_replace(hero, '([a-z])([A-Z])', '\\1_\\2', 'g')) AS hero_key
                 FROM players
-                """);
+                """).formatted(timeOffset));
 
-            addSummary(conn, metrics);
+            addSummary(conn, metrics, match, timeOffset);
             addRoster(conn, metrics);
             addKills(conn, metrics);
             addTeamfights(conn, metrics);
@@ -89,26 +93,46 @@ public final class MetricsRunner {
     // metric sections
     // ------------------------------------------------------------------
 
-    private void addSummary(Connection conn, ObjectNode root) throws Exception {
+    private void addSummary(Connection conn, ObjectNode root, JsonNode match, double timeOffset) throws Exception {
         ObjectNode s = root.putObject("summary");
-        queryOne(conn, "SELECT MIN(t) min_t, MAX(t) max_t FROM combatlog_v").ifPresent(row -> {
-            double start = dbl(row.get("min_t"));
-            double end = dbl(row.get("max_t"));
-            s.put("game_start_sec", round1(start));
-            s.put("game_end_sec", round1(end));
-            s.put("duration_sec", round1(end - start));
-        });
+        double duration = match.path("game_duration_sec").asDouble(0);
+        if (duration <= 0) {
+            Optional<Map<String, Object>> bounds = queryOne(conn, "SELECT MIN(t) min_t, MAX(t) max_t FROM combatlog_v");
+            if (bounds.isPresent()) {
+                duration = dbl(bounds.get().get("max_t")) - dbl(bounds.get().get("min_t"));
+            }
+        }
+        s.put("game_start_sec", 0);
+        s.put("game_end_sec", round1(duration));
+        s.put("duration_sec", round1(duration));
+        s.put("raw_time_offset_sec", round1(timeOffset));
+        int winner = match.path("winner_team").asInt(0);
+        if (winner == 2 || winner == 3) {
+            s.put("winner_team", winner);
+            s.put("winner_side", teamSide(winner));
+        }
         ArrayNode teamKills = s.putArray("team_kills");
-        queryMaps(conn, "SELECT attacker_team team, COUNT(*) kills FROM combatlog_v " +
-            "WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero AND attacker_team IS NOT NULL " +
-            "GROUP BY attacker_team ORDER BY attacker_team")
-            .forEach(row -> {
+        if (match.has("radiant_score") && match.has("dire_score")) {
+            addTeamScore(teamKills, 2, match.path("radiant_score").asLong());
+            addTeamScore(teamKills, 3, match.path("dire_score").asLong());
+        } else {
+            queryMaps(conn, """
+                WITH final AS (
+                  SELECT player, team, deaths,
+                         ROW_NUMBER() OVER (PARTITION BY player ORDER BY tick DESC) rn
+                  FROM players_v WHERE team IN (2, 3)
+                )
+                SELECT CASE team WHEN 2 THEN 3 ELSE 2 END team, SUM(deaths) kills
+                FROM final WHERE rn=1 GROUP BY team ORDER BY 1
+                """)
+                .forEach(row -> {
                 ObjectNode t = teamKills.addObject();
                 int team = intOf(row.get("team"));
                 t.put("team", team);
                 t.put("side", teamSide(team));
                 t.put("kills", longOf(row.get("kills")));
             });
+        }
         queryOne(conn, "SELECT t, attacker, target FROM combatlog_v " +
             "WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero ORDER BY t LIMIT 1")
             .ifPresent(row -> {
@@ -119,6 +143,13 @@ public final class MetricsRunner {
             });
         queryOne(conn, "SELECT COUNT(*) roshan FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target LIKE 'npc_dota_roshan%'")
             .ifPresent(row -> s.put("roshan_kills", longOf(row.get("roshan"))));
+    }
+
+    private static void addTeamScore(ArrayNode scores, int team, long kills) {
+        ObjectNode score = scores.addObject();
+        score.put("team", team);
+        score.put("side", teamSide(team));
+        score.put("kills", kills);
     }
 
     private void addRoster(Connection conn, ObjectNode root) throws Exception {
@@ -148,12 +179,13 @@ public final class MetricsRunner {
     private void addKills(Connection conn, ObjectNode root) throws Exception {
         ArrayNode arr = root.putArray("kills");
         queryMaps(conn, """
-            SELECT t, attacker, target, attacker_key, target_key, attacker_team, target_team, x, y, networth, assists
+            SELECT t, raw_t, attacker, target, attacker_key, target_key, attacker_team, target_team, x, y, networth, assists
             FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero
             ORDER BY t
             """).forEach(row -> {
             ObjectNode k = arr.addObject();
             k.put("t", round1(dbl(row.get("t"))));
+            k.put("raw_t", round1(dbl(row.get("raw_t"))));
             putStr(k, "killer", (String) row.get("attacker"));
             putStr(k, "killer_key", (String) row.get("attacker_key"));
             putStr(k, "victim", (String) row.get("target"));
@@ -230,6 +262,7 @@ public final class MetricsRunner {
                       (type='DOTA_COMBATLOG_HEAL' AND target_hero AND attacker LIKE 'npc_dota_hero_%%'))
                 """.formatted(ep[0], ep[1]));
             Set<String> participants = new LinkedHashSet<>();
+            Map<String, double[]> playerStats = new LinkedHashMap<>();
             double heroDamage = 0;
             long deaths = 0;
             for (Object[] row : events) {
@@ -245,14 +278,34 @@ public final class MetricsRunner {
                 }
                 if ("DOTA_COMBATLOG_DAMAGE".equals(type)) {
                     heroDamage += value;
+                    if (isHeroKey(ak)) {
+                        playerStats.computeIfAbsent(ak, key -> new double[4])[0] += value;
+                    }
+                    if (isHeroKey(tk)) {
+                        playerStats.computeIfAbsent(tk, key -> new double[4])[1] += value;
+                    }
                 } else if ("DOTA_COMBATLOG_DEATH".equals(type)) {
                     deaths++;
+                    if (isHeroKey(ak)) {
+                        playerStats.computeIfAbsent(ak, key -> new double[4])[2]++;
+                    }
+                    if (isHeroKey(tk)) {
+                        playerStats.computeIfAbsent(tk, key -> new double[4])[3]++;
+                    }
                 }
             }
             tf.put("hero_damage", Math.round(heroDamage));
             tf.put("deaths", deaths);
             ArrayNode part = tf.putArray("participants");
             participants.stream().sorted().forEach(part::add);
+            ObjectNode stats = tf.putObject("player_stats");
+            playerStats.forEach((hero, values) -> {
+                ObjectNode p = stats.putObject(hero);
+                p.put("damage_dealt", Math.round(values[0]));
+                p.put("damage_taken", Math.round(values[1]));
+                p.put("kills", (long) values[2]);
+                p.put("deaths", (long) values[3]);
+            });
         }
     }
 
@@ -502,5 +555,10 @@ public final class MetricsRunner {
 
     public Path dbFile() {
         return combatLog.getParent().resolve("metrics.duckdb");
+    }
+
+    private JsonNode readMatchJson() throws Exception {
+        Path match = combatLog.getParent().resolve("match.json");
+        return Files.exists(match) ? MAPPER.readTree(Files.readString(match)) : MAPPER.createObjectNode();
     }
 }

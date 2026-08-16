@@ -82,6 +82,10 @@ Downloaded replays are cached under `--cache` (default `replays/`) and reused if
   "build_num": 9358,
   "playback_ticks": 110029,
   "duration_sec": 3667.6,
+  "game_start_time_raw": 740.4,
+  "game_end_time_raw": 3338.4,
+  "game_duration_sec": 2598.0,
+  "winner_team": 3,
   "sample_interval_sec": 1,
   "combat_log_entries": 55020,
   "player_samples": 25990
@@ -129,6 +133,11 @@ One row per player per sample:
 `dota-replay-etl metrics <out>/<matchId>` loads both NDJSON streams into an in-memory
 DuckDB, computes the metrics below, and writes `metrics.json` plus a persistent
 `metrics.duckdb` (tables: `combatlog`, `players`, `kills`, `hero_damage`).
+The metrics layer subtracts `match.json.game_start_time_raw`, so all `t` values in
+`metrics.json` and `metrics.duckdb` use the official game clock (`0:00` = horn; negative
+values are pre-horn). The original timestamp remains available as `raw_t`. Match duration
+and winner come from `CDOTAGamerulesProxy`; team scores come from each `CDOTATeam` entity's
+official hero-kill counter (with final roster deaths as a fallback for older extracted data).
 
 ```json
 {
@@ -175,8 +184,9 @@ Notes:
 `dota-replay-etl report <out>/<matchId>` reads `metrics.json` and assembles a Chinese-language
 review prompt into `prompt.md` (dry-run only — it never calls an LLM). All numbers are
 pre-computed by the metrics layer; the prompt explicitly forbids the model from inventing or
-recalculating values, and asks it to close with an **MVP** and a **worst player** pick, each
-with data-backed reasons. The economy section shows the per-minute team income differential
+recalculating values, and asks it to close with an **MVP** and a **lowest role-completion** pick, each
+with data-backed reasons (the lower-performer pick may be declined when evidence is insufficient).
+The economy section shows the five-minute team income differential
 (carry-forward of each hero's cumulative income, labelled as a trend, not a bank balance).
 Copy `prompt.md` into any LLM to get the report, or paste it into a future `--api` mode.
 
@@ -190,7 +200,9 @@ comparison against the enemy team's top earner (with auto-detected overtake / st
 per-minute hero damage, the fights the hero actually participated in (with kill/death outcome
 per fight), and a farming/position table derived from `players.ndjson` (share of time spent in
 the enemy half and deep in enemy territory per game phase, split along the river diagonal).
-The prompt asks for a data-backed review of 出装决策 / 团战切入 / 打钱路线 / 关键决策 plus a
+It also includes each death's preceding 15-second cast, control, damage-source, and last-BKB-use
+evidence, plus per-fight personal damage dealt/taken. The prompt asks for a data-backed review of
+出装决策 / 团战切入 / 打钱路线 / 关键决策 plus a
 prioritised improvement list. Position facts are skipped when `players.ndjson` is absent.
 
 ## How extraction works

@@ -47,6 +47,11 @@ public final class ReplayExtractor {
         long combatCount;
         long playersCount;
         int lastTick;
+        float gameStartTime;
+        float gameEndTime;
+        int gameWinner;
+        int radiantScore;
+        int direScore;
         try (NdjsonWriter combat = new NdjsonWriter(combatPath);
              NdjsonWriter players = new NdjsonWriter(playersPath)) {
             ExtractionProcessor proc = new ExtractionProcessor(combat, players, meta, sampleIntervalSec);
@@ -56,15 +61,31 @@ public final class ReplayExtractor {
             lastTick = proc.lastTick();
             combatCount = combat.count();
             playersCount = players.count();
+            gameStartTime = proc.gameStartTime();
+            gameEndTime = proc.gameEndTime();
+            gameWinner = proc.gameWinner();
+            radiantScore = proc.radiantScore();
+            direScore = proc.direScore();
         }
 
-        writeMatchJson(matchPath, matchId, header, sampleIntervalSec, lastTick, combatCount, playersCount);
+        if (gameWinner == 0) {
+            Demo.CDemoFileInfo info = Clarity.infoForFile(demFile.toString());
+            if (info.hasGameInfo() && info.getGameInfo().hasDota()
+                && info.getGameInfo().getDota().hasGameWinner()) {
+                gameWinner = info.getGameInfo().getDota().getGameWinner();
+            }
+        }
+        writeMatchJson(matchPath, matchId, header, sampleIntervalSec, lastTick,
+            combatCount, playersCount, gameStartTime, gameEndTime, gameWinner,
+            radiantScore, direScore);
         return new Result(matchId, dir, combatPath, playersPath, matchPath, combatCount, playersCount, lastTick);
     }
 
     private static void writeMatchJson(Path path, long matchId, Demo.CDemoFileHeader header,
                                        int sampleIntervalSec, int lastTick,
-                                       long combatCount, long playersCount) throws Exception {
+                                       long combatCount, long playersCount,
+                                       float gameStartTime, float gameEndTime, int gameWinner,
+                                       int radiantScore, int direScore) throws Exception {
         ObjectNode root = MAPPER.createObjectNode();
         root.put("match_id", matchId);
         put(root, "map_name", header.getMapName());
@@ -76,6 +97,21 @@ public final class ReplayExtractor {
         root.put("sample_interval_sec", sampleIntervalSec);
         root.put("combat_log_entries", combatCount);
         root.put("player_samples", playersCount);
+        if (gameStartTime > 0) {
+            root.put("game_start_time_raw", round1(gameStartTime));
+        }
+        if (gameEndTime > gameStartTime) {
+            root.put("game_end_time_raw", round1(gameEndTime));
+            root.put("game_duration_sec", round1(gameEndTime - gameStartTime));
+        }
+        if (gameWinner == 2 || gameWinner == 3) {
+            root.put("winner_team", gameWinner);
+            root.put("winner_side", gameWinner == 2 ? "radiant" : "dire");
+        }
+        if (radiantScore >= 0 && direScore >= 0) {
+            root.put("radiant_score", radiantScore);
+            root.put("dire_score", direScore);
+        }
         Files.writeString(path, MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root) + "\n");
     }
 

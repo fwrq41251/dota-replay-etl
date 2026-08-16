@@ -61,10 +61,10 @@ class MetricsRunnerTest {
         ObjectNode m = runMetrics();
         com.fasterxml.jackson.databind.JsonNode s = m.path("summary");
         assertEquals(2, s.path("team_kills").size());
-        assertEquals(1, s.path("team_kills").get(0).path("kills").asLong());   // radiant killed axe
+        assertEquals(2, s.path("team_kills").get(0).path("kills").asLong());   // final Axe deaths
         assertEquals(1, s.path("team_kills").get(1).path("kills").asLong());   // dire killed pudge
         assertEquals(0, s.path("roshan_kills").asLong());
-        assertTrue(s.path("game_start_sec").asDouble() > 0);
+        assertEquals(0.0, s.path("game_start_sec").asDouble(), 1e-6);
     }
 
     @Test
@@ -137,5 +137,30 @@ class MetricsRunnerTest {
         assertTrue(m.path("item_timeline").size() >= 1);
         assertEquals("item_blinkdagger",
             m.path("item_timeline").get(0).path("items").get(0).path("item").asText());
+    }
+
+    @Test
+    void normalizesGameClockAndUsesReplayWinner() throws Exception {
+        Path combat = dir.resolve("combatlog.ndjson");
+        Path players = dir.resolve("players.ndjson");
+        Files.write(combat, List.of(
+            "{\"t\":300.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"attacker_team\":2,\"target_team\":3,\"value\":300,\"value_name\":\"none\",\"x\":1,\"y\":2,\"networth\":1000,\"assists\":[]}"
+        ));
+        Files.write(players, List.of(
+            "{\"t\":300.0,\"tick\":1,\"player\":0,\"team\":2,\"name\":\"alice\",\"hero\":\"Pudge\",\"level\":1,\"kills\":1,\"deaths\":0,\"assists\":0,\"x\":1,\"y\":1,\"hp\":100}",
+            "{\"t\":300.0,\"tick\":1,\"player\":1,\"team\":3,\"name\":\"bob\",\"hero\":\"Axe\",\"level\":1,\"kills\":0,\"deaths\":1,\"assists\":0,\"x\":2,\"y\":2,\"hp\":0}"
+        ));
+        Files.writeString(dir.resolve("match.json"),
+            "{\"game_start_time_raw\":280.0,\"game_end_time_raw\":880.0," +
+            "\"game_duration_sec\":600.0,\"winner_team\":2," +
+            "\"radiant_score\":9,\"dire_score\":7}");
+
+        ObjectNode m = new MetricsRunner(combat, players).run();
+        assertEquals(20.0, m.path("kills").get(0).path("t").asDouble(), 1e-6);
+        assertEquals(300.0, m.path("kills").get(0).path("raw_t").asDouble(), 1e-6);
+        assertEquals(600.0, m.path("summary").path("duration_sec").asDouble(), 1e-6);
+        assertEquals(2, m.path("summary").path("winner_team").asInt());
+        assertEquals(9, m.path("summary").path("team_kills").get(0).path("kills").asInt());
+        assertEquals(7, m.path("summary").path("team_kills").get(1).path("kills").asInt());
     }
 }
