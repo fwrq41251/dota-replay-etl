@@ -64,16 +64,29 @@ public final class MetricsRunner {
                 "CREATE VIEW combatlog AS SELECT * FROM read_ndjson('" + escape(combatLog) + "')");
             conn.createStatement().execute(
                 "CREATE VIEW players AS SELECT * FROM read_ndjson('" + escape(players) + "')");
+            conn.createStatement().execute("""
+                CREATE TEMP TABLE hero_key_map AS
+                SELECT DISTINCT
+                  lower(replace(replace(name, 'npc_dota_hero_', ''), '_', '')) AS norm,
+                  replace(name, 'npc_dota_hero_', '') AS hero_key
+                FROM (
+                  SELECT attacker AS name FROM combatlog WHERE attacker LIKE 'npc_dota_hero_%'
+                  UNION
+                  SELECT target AS name FROM combatlog WHERE target LIKE 'npc_dota_hero_%'
+                )
+                """);
+            conn.createStatement().execute(("""
+                CREATE VIEW players_v AS SELECT * EXCLUDE(t), t AS raw_t, t - %f AS t,
+                  COALESCE((SELECT hero_key FROM hero_key_map
+                            WHERE norm = lower(replace(hero, '_', ''))),
+                           lower(regexp_replace(hero, '([a-z])([A-Z])', '\\1_\\2', 'g'))) AS hero_key
+                FROM players
+                """).formatted(timeOffset));
             conn.createStatement().execute(("""
                 CREATE VIEW combatlog_v AS SELECT * EXCLUDE(t), t AS raw_t, t - %f AS t,
                   replace(target, 'npc_dota_hero_', '') AS target_key,
                   replace(attacker, 'npc_dota_hero_', '') AS attacker_key
                 FROM combatlog
-                """).formatted(timeOffset));
-            conn.createStatement().execute(("""
-                CREATE VIEW players_v AS SELECT * EXCLUDE(t), t AS raw_t, t - %f AS t,
-                  lower(regexp_replace(hero, '([a-z])([A-Z])', '\\1_\\2', 'g')) AS hero_key
-                FROM players
                 """).formatted(timeOffset));
 
             addSummary(conn, metrics, match, timeOffset);
