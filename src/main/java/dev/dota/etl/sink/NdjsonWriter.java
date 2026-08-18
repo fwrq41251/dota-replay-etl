@@ -17,11 +17,9 @@ public final class NdjsonWriter implements AutoCloseable {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final BufferedWriter writer;
-    private final String name;
     private long count;
 
     public NdjsonWriter(Path file) {
-        this.name = file.getFileName().toString();
         try {
             Files.createDirectories(file.getParent());
             this.writer = Files.newBufferedWriter(
@@ -54,10 +52,6 @@ public final class NdjsonWriter implements AutoCloseable {
 
     public long count() {
         return count;
-    }
-
-    public String name() {
-        return name;
     }
 
     @Override

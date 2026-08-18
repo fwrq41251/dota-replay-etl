@@ -50,6 +50,17 @@ public final class MetricsRunner {
     private static final double WEIGHT_DEATH = 4.0;
     private static final double MIN_ACTIVE_SCORE = 8.0;
 
+    /**
+     * Columns the metrics layer relies on for correct results. A missing column would silently
+     * turn into NULL (skipped filters / zero sums), so the NDJSON inputs are validated up front
+     * and rejected with a clear error instead of producing wrong-looking metrics.
+     */
+    private static final List<String> REQUIRED_COMBATLOG_COLUMNS = List.of(
+        "t", "type", "attacker", "target", "attacker_hero", "target_hero",
+        "attacker_team", "target_team", "value");
+    private static final List<String> REQUIRED_PLAYERS_COLUMNS = List.of(
+        "t", "tick", "player", "team", "hero", "name", "level", "kills", "deaths", "assists");
+
     private final Path combatLog;
     private final Path players;
 
@@ -104,6 +115,8 @@ public final class MetricsRunner {
                       replace(attacker, 'npc_dota_hero_', '') AS attacker_key
                     FROM combatlog
                     """).formatted(timeOffset));
+
+                validateInputSchema(conn);
 
                 addSummary(conn, metrics, match, timeOffset);
                 addRoster(conn, metrics);
@@ -243,71 +256,27 @@ public final class MetricsRunner {
     }
 
     private void addTeamfights(Connection conn, ObjectNode root) throws Exception {
-        String score = "dmg_events + " + WEIGHT_DEATH + " * deaths";
-        List<double[]> episodes = new ArrayList<>();
-        query(conn, """
-            WITH act AS (
-              SELECT FLOOR(t / %d) * %d AS b,
-                     COUNT(*) FILTER (WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND attacker LIKE 'npc_dota_hero_%%') AS dmg_events,
-                     COUNT(*) FILTER (WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero) AS deaths
-              FROM combatlog_v
-              WHERE t >= (SELECT MIN(t) FROM combatlog_v)
-              GROUP BY 1
-            ),
-            scored AS (
-              SELECT b, %s AS score,
-                     (%s >= %f) AS active
-              FROM act
-            ),
-            lagged AS (
-              SELECT b, score, active,
-                     LAG(b) OVER (ORDER BY b) AS prev_b,
-                     LAG(active) OVER (ORDER BY b) AS prev_active
-              FROM scored
-            ),
-            islands AS (
-              SELECT b, score, active,
-                SUM(CASE WHEN active AND
-                    (NOT COALESCE(prev_active, false) OR b - prev_b > %d)
-                    THEN 1 ELSE 0 END)
-                  OVER (ORDER BY b) AS grp
-              FROM lagged
-            )
-            SELECT grp, MIN(b) start_b, MAX(b) end_b, ROUND(SUM(score), 1) total_score,
-                   SUM(CASE WHEN active THEN 1 ELSE 0 END) active_buckets
-            FROM islands WHERE active
-            GROUP BY grp ORDER BY start_b
-            """.formatted(BUCKET_SEC, BUCKET_SEC, score, score, MIN_ACTIVE_SCORE, BUCKET_SEC))
-            .forEach(row -> episodes.add(new double[]{
-                dbl(row[1]), dbl(row[2]) + BUCKET_SEC
-            }));
-
         ArrayNode arr = root.putArray("teamfights");
-        int idx = 0;
-        for (double[] ep : episodes) {
+        for (Object[] row : query(conn, teamfightEpisodesSql())) {
+            int id = intOf(row[0]);
+            double start = dbl(row[1]);
+            double end = dbl(row[2]);
             ObjectNode tf = arr.addObject();
-            tf.put("id", idx++);
-            tf.put("start", round1(ep[0]));
-            tf.put("end", round1(ep[1]));
-            tf.put("duration", round1(ep[1] - ep[0]));
+            tf.put("id", id);
+            tf.put("start", round1(start));
+            tf.put("end", round1(end));
+            tf.put("duration", round1(end - start));
+            tf.put("hero_damage", Math.round(dbl(row[3])));
+            tf.put("deaths", longOf(row[4]));
 
-            List<Object[]> events = query(conn, """
-                SELECT attacker_key, target_key, type, value
-                FROM combatlog_v
-                WHERE t >= %f AND t <= %f AND (
-                      (type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND attacker LIKE 'npc_dota_hero_%%') OR
-                      (type='DOTA_COMBATLOG_DEATH' AND target_hero) OR
-                      (type='DOTA_COMBATLOG_HEAL' AND target_hero AND attacker LIKE 'npc_dota_hero_%%'))
-                """.formatted(ep[0], ep[1]));
+            List<Object[]> events = query(conn, teamfightEventsSql().formatted(start, end));
             Set<String> participants = new LinkedHashSet<>();
             Map<String, double[]> playerStats = new LinkedHashMap<>();
-            double heroDamage = 0;
-            long deaths = 0;
-            for (Object[] row : events) {
-                String ak = (String) row[0];
-                String tk = (String) row[1];
-                String type = (String) row[2];
-                double value = row[3] == null ? 0 : ((Number) row[3]).doubleValue();
+            for (Object[] event : events) {
+                String ak = (String) event[0];
+                String tk = (String) event[1];
+                String type = (String) event[2];
+                double value = event[3] == null ? 0 : ((Number) event[3]).doubleValue();
                 if (isHeroKey(ak)) {
                     participants.add(ak);
                 }
@@ -315,7 +284,6 @@ public final class MetricsRunner {
                     participants.add(tk);
                 }
                 if ("DOTA_COMBATLOG_DAMAGE".equals(type)) {
-                    heroDamage += value;
                     if (isHeroKey(ak)) {
                         playerStats.computeIfAbsent(ak, key -> new double[4])[0] += value;
                     }
@@ -323,7 +291,6 @@ public final class MetricsRunner {
                         playerStats.computeIfAbsent(tk, key -> new double[4])[1] += value;
                     }
                 } else if ("DOTA_COMBATLOG_DEATH".equals(type)) {
-                    deaths++;
                     if (isHeroKey(ak)) {
                         playerStats.computeIfAbsent(ak, key -> new double[4])[2]++;
                     }
@@ -332,8 +299,6 @@ public final class MetricsRunner {
                     }
                 }
             }
-            tf.put("hero_damage", Math.round(heroDamage));
-            tf.put("deaths", deaths);
             ArrayNode part = tf.putArray("participants");
             participants.stream().sorted().forEach(part::add);
             ObjectNode stats = tf.putObject("player_stats");
@@ -347,6 +312,61 @@ public final class MetricsRunner {
         }
     }
 
+    /** Episodes of elevated combat activity; the same SQL is used to populate metrics.duckdb. */
+    private static String teamfightEpisodesSql() {
+        String score = "dmg_events + " + WEIGHT_DEATH + " * deaths";
+        return """
+            WITH act AS (
+              SELECT FLOOR(t / {BUCKET}) * {BUCKET} AS b,
+                     COUNT(*) FILTER (WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND attacker LIKE 'npc_dota_hero_%') AS dmg_events,
+                     COUNT(*) FILTER (WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero) AS deaths
+              FROM combatlog_v
+              WHERE t >= (SELECT MIN(t) FROM combatlog_v)
+              GROUP BY 1
+            ),
+            scored AS (
+              SELECT b, {SCORE} AS score, ({SCORE} >= {MIN_ACTIVE}) AS active
+              FROM act
+            ),
+            lagged AS (
+              SELECT b, score, active,
+                     LAG(b) OVER (ORDER BY b) AS prev_b,
+                     LAG(active) OVER (ORDER BY b) AS prev_active
+              FROM scored
+            ),
+            islands AS (
+              SELECT b, score, active,
+                SUM(CASE WHEN active AND (NOT COALESCE(prev_active, false) OR b - prev_b > {BUCKET}) THEN 1 ELSE 0 END)
+                  OVER (ORDER BY b) AS grp
+              FROM lagged
+            ),
+            episodes AS (
+              SELECT grp, MIN(b) AS start_b, MAX(b) + {BUCKET} AS end_b
+              FROM islands WHERE active GROUP BY grp
+            )
+            SELECT ROW_NUMBER() OVER (ORDER BY start_b) - 1 AS id,
+                   start_b AS start, end_b AS end,
+                   COALESCE(SUM(CASE WHEN c.type='DOTA_COMBATLOG_DAMAGE' AND c.target_hero AND c.attacker LIKE 'npc_dota_hero_%' THEN c.value END), 0) AS hero_damage,
+                   COUNT(*) FILTER (WHERE c.type='DOTA_COMBATLOG_DEATH' AND c.target_hero) AS deaths
+            FROM episodes e JOIN combatlog_v c ON c.t >= e.start_b AND c.t <= e.end_b
+            GROUP BY e.grp, start_b, end_b ORDER BY start_b
+            """.replace("{BUCKET}", String.valueOf(BUCKET_SEC))
+            .replace("{MIN_ACTIVE}", String.valueOf(MIN_ACTIVE_SCORE))
+            .replace("{SCORE}", score);
+    }
+
+    /** Per-episode event rows used to assemble participants / per-player damage and kills. */
+    private static String teamfightEventsSql() {
+        return """
+            SELECT attacker_key, target_key, type, value
+            FROM combatlog_v
+            WHERE t >= %f AND t <= %f AND (
+                  (type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND attacker LIKE 'npc_dota_hero_%%') OR
+                  (type='DOTA_COMBATLOG_DEATH' AND target_hero) OR
+                  (type='DOTA_COMBATLOG_HEAL' AND target_hero AND attacker LIKE 'npc_dota_hero_%%'))
+            """;
+    }
+
     private void addGoldCurves(Connection conn, ObjectNode root) throws Exception {
         addCurves(conn, root, "gold_curves", "DOTA_COMBATLOG_GOLD", 30, "gold");
     }
@@ -358,16 +378,7 @@ public final class MetricsRunner {
     private void addCurves(Connection conn, ObjectNode root, String key,
                            String type, int bucketSec, String valueKey) throws Exception {
         ArrayNode arr = root.putArray(key);
-        List<Object[]> rows = query(conn, """
-            WITH src AS (
-              SELECT target_key AS hero, t, value FROM combatlog_v WHERE type='%s' AND value IS NOT NULL AND target_key IS NOT NULL
-            ),
-            cum AS (
-              SELECT hero, t, SUM(value) OVER (PARTITION BY hero ORDER BY t) AS cumv FROM src
-            )
-            SELECT hero, FLOOR(t / %d) * %d AS b, MAX(cumv) AS v
-            FROM cum GROUP BY hero, b ORDER BY hero, b
-            """.formatted(type, bucketSec, bucketSec));
+        List<Object[]> rows = query(conn, curveSql(type, bucketSec));
         String curHero = null;
         ArrayNode points = null;
         for (Object[] row : rows) {
@@ -384,14 +395,23 @@ public final class MetricsRunner {
         }
     }
 
+    /** Cumulative GOLD/XP per hero bucketed every {@code bucketSec} seconds. */
+    private static String curveSql(String type, int bucketSec) {
+        return """
+            WITH src AS (
+              SELECT target_key AS hero, t, value FROM combatlog_v WHERE type='%s' AND value IS NOT NULL AND target_key IS NOT NULL
+            ),
+            cum AS (
+              SELECT hero, t, SUM(value) OVER (PARTITION BY hero ORDER BY t) AS cumv FROM src
+            )
+            SELECT hero, FLOOR(t / %d) * %d AS t_bucket, MAX(cumv) AS value
+            FROM cum GROUP BY hero, t_bucket ORDER BY hero, t_bucket
+            """.formatted(type, bucketSec, bucketSec);
+    }
+
     private void addItemTimeline(Connection conn, ObjectNode root) throws Exception {
         ArrayNode arr = root.putArray("item_timeline");
-        List<Object[]> rows = query(conn, """
-            SELECT target_key AS hero, value_name item, t
-            FROM combatlog_v
-            WHERE type='DOTA_COMBATLOG_PURCHASE' AND value_name IS NOT NULL AND target_key IS NOT NULL
-            ORDER BY target_key, t
-            """);
+        List<Object[]> rows = query(conn, itemTimelineSql());
         String curHero = null;
         ArrayNode items = null;
         for (Object[] row : rows) {
@@ -408,17 +428,20 @@ public final class MetricsRunner {
         }
     }
 
+    private static String itemTimelineSql() {
+        return """
+            SELECT target_key AS hero, value_name AS item, t
+            FROM combatlog_v
+            WHERE type='DOTA_COMBATLOG_PURCHASE' AND value_name IS NOT NULL AND target_key IS NOT NULL
+            ORDER BY target_key, t
+            """;
+    }
+
     private void addDamage(Connection conn, ObjectNode root) throws Exception {
         ArrayNode arr = root.putArray("damage");
         Map<String, ObjectNode> byHero = new LinkedHashMap<>();
         Map<String, long[]> totals = new LinkedHashMap<>();
-        for (Object[] row : query(conn, """
-            SELECT attacker_key AS hero, FLOOR(t / 60) * 60 AS b, SUM(value) AS v
-            FROM combatlog_v
-            WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero
-              AND attacker LIKE 'npc_dota_hero_%%' AND attacker_key IS NOT NULL
-            GROUP BY attacker_key, b ORDER BY attacker_key, b
-            """)) {
+        for (Object[] row : query(conn, damagePerMinuteSql())) {
             String hero = (String) row[0];
             ObjectNode node = byHero.get(hero);
             if (node == null) {
@@ -432,15 +455,10 @@ public final class MetricsRunner {
             long v = longOf(row[2]);
             totals.get(hero)[0] += v;
             ObjectNode pt = ((ArrayNode) node.get("per_minute")).addObject();
-            pt.put("min", (long) dbl(row[1]) / 60);
+            pt.put("min", longOf(row[1]));
             pt.put("dealt", v);
         }
-        for (Object[] row : query(conn, """
-            SELECT target_key AS hero, SUM(value) AS v
-            FROM combatlog_v
-            WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND target_key IS NOT NULL
-            GROUP BY target_key
-            """)) {
+        for (Object[] row : query(conn, damageTakenSql())) {
             String hero = (String) row[0];
             ObjectNode node = byHero.get(hero);
             if (node == null) {
@@ -456,6 +474,44 @@ public final class MetricsRunner {
         byHero.forEach((hero, node) -> node.put("dealt_total", totals.get(hero)[0]));
     }
 
+    private static String damagePerMinuteSql() {
+        return """
+            SELECT attacker_key AS hero, FLOOR(t / 60) AS minute, SUM(value) AS dealt
+            FROM combatlog_v
+            WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero
+              AND attacker LIKE 'npc_dota_hero_%' AND attacker_key IS NOT NULL
+            GROUP BY attacker_key, minute ORDER BY attacker_key, minute
+            """;
+    }
+
+    private static String damageTakenSql() {
+        return """
+            SELECT target_key AS hero, SUM(value) AS taken_total
+            FROM combatlog_v
+            WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND target_key IS NOT NULL
+            GROUP BY target_key
+            """;
+    }
+
+    /** Per-hero dealt/taken totals, merged over both directions (mirrors the damage[] JSON section). */
+    private static String damageTotalsSql() {
+        return """
+            SELECT COALESCE(d.hero, t.hero) AS hero,
+                   COALESCE(d.dealt_total, 0) AS dealt_total,
+                   COALESCE(t.taken_total, 0) AS taken_total
+            FROM (SELECT attacker_key AS hero, SUM(value) AS dealt_total
+                  FROM combatlog_v
+                  WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero
+                    AND attacker LIKE 'npc_dota_hero_%' AND attacker_key IS NOT NULL
+                  GROUP BY attacker_key) d
+            FULL OUTER JOIN (SELECT target_key AS hero, SUM(value) AS taken_total
+                  FROM combatlog_v
+                  WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND target_key IS NOT NULL
+                  GROUP BY target_key) t ON d.hero = t.hero
+            ORDER BY hero
+            """;
+    }
+
     private void persistTables(Connection conn, Path output) throws Exception {
         try (Statement st = conn.createStatement()) {
             st.execute("ATTACH '" + escape(output) + "' AS out (TYPE duckdb)");
@@ -465,6 +521,13 @@ public final class MetricsRunner {
                 "WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero");
             st.execute("CREATE OR REPLACE TABLE out.hero_damage AS SELECT * FROM combatlog_v " +
                 "WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero");
+            // the same SQL that drives the metrics.json sections, so ad-hoc SQL sees the real metrics
+            st.execute("CREATE OR REPLACE TABLE out.gold_curves AS " + curveSql("DOTA_COMBATLOG_GOLD", 30));
+            st.execute("CREATE OR REPLACE TABLE out.xp_curves AS " + curveSql("DOTA_COMBATLOG_XP", 60));
+            st.execute("CREATE OR REPLACE TABLE out.item_timeline AS " + itemTimelineSql());
+            st.execute("CREATE OR REPLACE TABLE out.damage_per_minute AS " + damagePerMinuteSql());
+            st.execute("CREATE OR REPLACE TABLE out.damage AS " + damageTotalsSql());
+            st.execute("CREATE OR REPLACE TABLE out.teamfights AS " + teamfightEpisodesSql());
         }
     }
 
@@ -581,6 +644,38 @@ public final class MetricsRunner {
 
     private static String escape(Path p) {
         return p.toString().replace("'", "''");
+    }
+
+    private void validateInputSchema(Connection conn) throws Exception {
+        validateColumns("combatlog.ndjson", columnsOf(conn, "combatlog"), REQUIRED_COMBATLOG_COLUMNS);
+        validateColumns("players.ndjson", columnsOf(conn, "players"), REQUIRED_PLAYERS_COLUMNS);
+    }
+
+    /** Union of field names across the whole NDJSON file, as materialised by read_ndjson. */
+    private static Set<String> columnsOf(Connection conn, String table) throws Exception {
+        Set<String> cols = new LinkedHashSet<>();
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT * FROM " + table + " LIMIT 0")) {
+            ResultSetMetaData md = rs.getMetaData();
+            for (int i = 1; i <= md.getColumnCount(); i++) {
+                cols.add(md.getColumnLabel(i));
+            }
+        }
+        return cols;
+    }
+
+    private static void validateColumns(String source, Set<String> present, List<String> required) {
+        List<String> missing = new ArrayList<>();
+        for (String column : required) {
+            if (!present.contains(column)) {
+                missing.add(column);
+            }
+        }
+        if (!missing.isEmpty()) {
+            throw new IllegalArgumentException(source + " is missing required column(s): "
+                + String.join(", ", missing)
+                + " — the file may come from an older ETL schema_version; re-run `analyze` to regenerate it");
+        }
     }
 
     public Path metricsJson() {

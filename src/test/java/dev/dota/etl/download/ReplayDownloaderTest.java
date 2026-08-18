@@ -1,12 +1,16 @@
 package dev.dota.etl.download;
 
+import dev.dota.etl.util.BuildInfo;
 import org.apache.commons.compress.compressors.bzip2.BZip2CompressorOutputStream;
 import org.apache.commons.compress.compressors.zstandard.ZstdCompressorOutputStream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.net.URI;
+import java.net.http.HttpRequest;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -60,5 +64,15 @@ class ReplayDownloaderTest {
         assertTrue(ReplayDownloader.isReplayFile(valid));
         assertFalse(ReplayDownloader.isReplayFile(partial));
         assertFalse(ReplayDownloader.isReplayFile(dir.resolve("missing.dem")));
+    }
+
+    @Test
+    void httpRequestsCarryUserAgent() {
+        HttpRequest req = ReplayDownloader.requestBuilder(
+                URI.create("https://api.opendota.com/api/matches/12345"), Duration.ofSeconds(30))
+            .GET()
+            .build();
+        assertEquals("dota-replay-etl/" + BuildInfo.version(),
+            req.headers().firstValue("User-Agent").orElse(null));
     }
 }

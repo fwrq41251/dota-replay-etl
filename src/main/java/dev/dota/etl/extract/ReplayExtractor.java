@@ -50,14 +50,6 @@ public final class ReplayExtractor {
         Path playersTemp = AtomicFiles.createTempSibling(playersPath);
         Path matchTemp = AtomicFiles.createTempSibling(matchPath);
 
-        MatchMeta meta = new MatchMeta(
-            matchId,
-            header.getMapName(),
-            header.getDemoFileStamp(),
-            header.getNetworkProtocol(),
-            header.getBuildNum()
-        );
-
         long combatCount;
         long playersCount;
         int lastTick;
@@ -69,7 +61,7 @@ public final class ReplayExtractor {
         try {
             try (NdjsonWriter combat = new NdjsonWriter(combatTemp);
                  NdjsonWriter players = new NdjsonWriter(playersTemp)) {
-                ExtractionProcessor proc = new ExtractionProcessor(combat, players, meta, sampleIntervalSec);
+                ExtractionProcessor proc = new ExtractionProcessor(combat, players, sampleIntervalSec);
                 try (MappedFileSource source = new MappedFileSource(demFile.toString())) {
                     new SimpleRunner(source).runWith(proc);
                 }

@@ -3,6 +3,7 @@ package dev.dota.etl.download;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.dota.etl.util.AtomicFiles;
+import dev.dota.etl.util.BuildInfo;
 import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream;
 import org.apache.commons.compress.compressors.zstandard.ZstdCompressorInputStream;
 import org.slf4j.Logger;
@@ -44,6 +45,9 @@ public final class ReplayDownloader {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    /** Identifies this tool to public APIs (OpenDota in particular throttles requests without a UA). */
+    static final String USER_AGENT = "dota-replay-etl/" + BuildInfo.version();
+
     private final HttpClient http;
     private final String apiKey;
 
@@ -57,6 +61,13 @@ public final class ReplayDownloader {
             .connectTimeout(Duration.ofSeconds(30))
             .followRedirects(HttpClient.Redirect.NORMAL)
             .build();
+    }
+
+    /** Builds an HTTP request carrying this tool's User-Agent (visible to package tests). */
+    static HttpRequest.Builder requestBuilder(URI uri, Duration timeout) {
+        return HttpRequest.newBuilder(uri)
+            .timeout(timeout)
+            .header("User-Agent", USER_AGENT);
     }
 
     /** Downloads and decompresses the replay for a match id. Returns the path to the plain .dem file. */
@@ -80,10 +91,7 @@ public final class ReplayDownloader {
         Path compressedTemp = AtomicFiles.createTempSibling(destDir.resolve(matchId + ".dem.compressed"));
         Path demTemp = AtomicFiles.createTempSibling(demPath);
         try {
-            HttpRequest req = HttpRequest.newBuilder(cdnUrl)
-                .timeout(Duration.ofMinutes(20))
-                .GET()
-                .build();
+            HttpRequest req = requestBuilder(cdnUrl, Duration.ofMinutes(20)).GET().build();
             HttpResponse<Path> resp = http.send(req, HttpResponse.BodyHandlers.ofFile(compressedTemp));
             if (resp.statusCode() != 200) {
                 throw new IOException("replay CDN returned HTTP " + resp.statusCode() + " for " + cdnUrl
@@ -108,10 +116,7 @@ public final class ReplayDownloader {
 
     private ReplayInfo resolveViaSteam(long matchId) throws IOException, InterruptedException {
         URI uri = URI.create(STEAM_REPLAY_API + "?key=" + apiKey + "&match_id=" + matchId + "&appid=570");
-        HttpRequest req = HttpRequest.newBuilder(uri)
-            .timeout(Duration.ofSeconds(30))
-            .GET()
-            .build();
+        HttpRequest req = requestBuilder(uri, Duration.ofSeconds(30)).GET().build();
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() != 200) {
             throw new IOException("GetReplayInfo returned HTTP " + resp.statusCode());
@@ -139,8 +144,7 @@ public final class ReplayDownloader {
         }
         // Very recent matches are often not parsed yet; ask OpenDota to parse and poll.
         log.info("OpenDota has no replay_salt/cluster for match {} yet; requesting a parse and polling...", matchId);
-        HttpRequest req = HttpRequest.newBuilder(URI.create(OPEN_DOTA_REQUEST_API + matchId))
-            .timeout(Duration.ofSeconds(30))
+        HttpRequest req = requestBuilder(URI.create(OPEN_DOTA_REQUEST_API + matchId), Duration.ofSeconds(30))
             .POST(HttpRequest.BodyPublishers.noBody())
             .build();
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
@@ -162,8 +166,7 @@ public final class ReplayDownloader {
 
     /** Returns replay info, or null when OpenDota hasn't parsed the match yet. */
     private ReplayInfo openDotaReplayInfo(long matchId) throws IOException, InterruptedException {
-        HttpRequest req = HttpRequest.newBuilder(URI.create(OPEN_DOTA_MATCH_API + matchId))
-            .timeout(Duration.ofSeconds(30))
+        HttpRequest req = requestBuilder(URI.create(OPEN_DOTA_MATCH_API + matchId), Duration.ofSeconds(30))
             .GET()
             .build();
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());

@@ -17,6 +17,8 @@ Produces `target/dota-replay-etl-0.1.0-SNAPSHOT.jar` (shaded fat jar).
 
 ```
 dota-replay-etl analyze <matchIdOrFile> [--out DIR] [--cache DIR] [--sample SEC]
+dota-replay-etl pipeline <matchIdOrFile> [--out DIR] [--cache DIR] [--sample SEC]
+                          [--report] [--player-review HERO]
 dota-replay-etl metrics <outputDir>
 dota-replay-etl report <outputDir>
 dota-replay-etl player-review <outputDir> <heroOrNameOrIndex>
@@ -36,6 +38,12 @@ java -jar target/dota-replay-etl-0.1.0-SNAPSHOT.jar analyze 6676393091 --cache r
 
 # faster state sampling
 java -jar target/dota-replay-etl-0.1.0-SNAPSHOT.jar analyze replays/6676393091.dem --sample 5
+
+# extract + metrics in one step
+java -jar target/dota-replay-etl-0.1.0-SNAPSHOT.jar pipeline replays/6676393091.dem --out out
+
+# extract + metrics + assemble the match prompt (and one player review)
+java -jar target/dota-replay-etl-0.1.0-SNAPSHOT.jar pipeline replays/6676393091.dem --report --player-review slark
 
 # compute match metrics from an analyze result
 java -jar target/dota-replay-etl-0.1.0-SNAPSHOT.jar metrics out/6676393091
@@ -140,7 +148,13 @@ One row per player per sample:
 
 `dota-replay-etl metrics <out>/<matchId>` loads both NDJSON streams into an in-memory
 DuckDB, computes the metrics below, and writes `metrics.json` plus a persistent
-`metrics.duckdb` (tables: `combatlog`, `players`, `kills`, `hero_damage`).
+`metrics.duckdb`. The DuckDB file exposes the raw streams (`combatlog`, `players`,
+`kills`, `hero_damage`) and every computed metric as a table (`gold_curves`, `xp_curves`,
+`item_timeline`, `damage`, `damage_per_minute`, `teamfights`) built from the same SQL
+that drives the JSON sections, so ad-hoc SQL sees exactly the metrics the reports use.
+The inputs are validated up front: if a critical column (`t`, `type`, hero names/keys,
+teams, `value`, ...) is missing from either NDJSON file, the command fails with a clear
+error instead of producing silently wrong metrics (re-run `analyze` to regenerate).
 The metrics layer subtracts `match.json.game_start_time_raw`, so all `t` values in
 `metrics.json` and `metrics.duckdb` use the official game clock (`0:00` = horn; negative
 values are pre-horn). The original timestamp remains available as `raw_t`. Match duration
@@ -237,5 +251,6 @@ mvn test
 
 Covers coordinate conversion, hero name parsing, match-id parsing from filenames, NDJSON
 writer round-trip / overwrite semantics, the DuckDB metrics computation (summary, roster,
-kills, teamfights, curves, item timeline, damage) against a synthetic fixture, the match
-review prompt assembly, and the single-player review prompt assembly.
+kills, teamfights, curves, item timeline, damage) against a synthetic fixture, the
+persisted DuckDB tables, the match review prompt assembly, the single-player review prompt
+assembly, HTTP User-Agent wiring, and CLI argument validation (including `pipeline`).

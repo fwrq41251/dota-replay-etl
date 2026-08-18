@@ -7,9 +7,13 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class MetricsRunnerTest {
@@ -167,5 +171,76 @@ class MetricsRunnerTest {
         assertEquals(2, m.path("summary").path("winner_team").asInt());
         assertEquals(9, m.path("summary").path("team_kills").get(0).path("kills").asInt());
         assertEquals(7, m.path("summary").path("team_kills").get(1).path("kills").asInt());
+    }
+
+    @Test
+    void rejectsCombatLogMissingCriticalColumns() throws Exception {
+        Path combat = dir.resolve("combatlog.ndjson");
+        Path players = dir.resolve("players.ndjson");
+        // missing attacker_team / target_team / attacker_hero would silently skew team_kills and damage
+        Files.write(combat, List.of(
+            "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"value\":300}"
+        ));
+        Files.write(players, List.of(
+            "{\"t\":100.0,\"tick\":3000,\"player\":0,\"team\":2,\"name\":\"alice\",\"hero\":\"Pudge\",\"level\":5,\"kills\":2,\"deaths\":1,\"assists\":3}"
+        ));
+        assertThrows(IllegalArgumentException.class,
+            () -> new MetricsRunner(combat, players).run());
+    }
+
+    @Test
+    void persistsAllDerivedMetricTables() throws Exception {
+        ObjectNode m = runMetrics();
+        Path db = dir.resolve("metrics.duckdb");
+        assertTrue(Files.exists(db), "expected a persisted metrics.duckdb");
+        try (Connection conn = DriverManager.getConnection("jdbc:duckdb:" + db)) {
+            List<String> tables = new ArrayList<>();
+            try (var rs = conn.createStatement().executeQuery(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema='main' ORDER BY table_name")) {
+                while (rs.next()) {
+                    tables.add(rs.getString(1));
+                }
+            }
+            for (String t : List.of("combatlog", "players", "kills", "hero_damage",
+                "gold_curves", "xp_curves", "item_timeline", "damage", "damage_per_minute", "teamfights")) {
+                assertTrue(tables.contains(t), "expected persisted table " + t + " but got " + tables);
+            }
+            long teamfights = 0;
+            try (var rs = conn.createStatement().executeQuery("SELECT COUNT(*) FROM teamfights")) {
+                if (rs.next()) {
+                    teamfights = rs.getLong(1);
+                }
+            }
+            assertEquals(m.path("teamfights").size(), teamfights);
+            long damageHeroes = 0;
+            try (var rs = conn.createStatement().executeQuery("SELECT COUNT(*) FROM damage")) {
+                if (rs.next()) {
+                    damageHeroes = rs.getLong(1);
+                }
+            }
+            assertTrue(damageHeroes >= 2, "damage table should cover both heroes");
+            long goldHeroes = 0;
+            try (var rs = conn.createStatement().executeQuery("SELECT COUNT(DISTINCT hero) FROM gold_curves")) {
+                if (rs.next()) {
+                    goldHeroes = rs.getLong(1);
+                }
+            }
+            assertTrue(goldHeroes >= 1, "gold_curves should contain at least one hero");
+        }
+    }
+
+    @Test
+    void rejectsPlayersMissingTeam() throws Exception {
+        Path combat = dir.resolve("combatlog.ndjson");
+        Path players = dir.resolve("players.ndjson");
+        Files.write(combat, List.of(
+            "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"attacker_team\":2,\"target_team\":3,\"value\":300}"
+        ));
+        // player rows carry no team -> side attribution in roster / team_kills would be broken
+        Files.write(players, List.of(
+            "{\"t\":100.0,\"tick\":3000,\"player\":0,\"name\":\"alice\",\"hero\":\"Pudge\",\"level\":5,\"kills\":2,\"deaths\":1,\"assists\":3}"
+        ));
+        assertThrows(IllegalArgumentException.class,
+            () -> new MetricsRunner(combat, players).run());
     }
 }

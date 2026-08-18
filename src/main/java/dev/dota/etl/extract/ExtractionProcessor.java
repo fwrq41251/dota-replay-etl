@@ -63,7 +63,6 @@ public class ExtractionProcessor {
 
     private final NdjsonWriter combatLogWriter;
     private final NdjsonWriter playersWriter;
-    private final MatchMeta matchMeta;
     private final float sampleIntervalSec;
 
     private DTClass playerResourceClass;
@@ -88,10 +87,9 @@ public class ExtractionProcessor {
     private int direScore = -1;
 
     public ExtractionProcessor(NdjsonWriter combatLogWriter, NdjsonWriter playersWriter,
-                               MatchMeta matchMeta, int sampleIntervalSec) {
+                               int sampleIntervalSec) {
         this.combatLogWriter = combatLogWriter;
         this.playersWriter = playersWriter;
-        this.matchMeta = matchMeta;
         this.sampleIntervalSec = Math.max(1, sampleIntervalSec);
     }
 

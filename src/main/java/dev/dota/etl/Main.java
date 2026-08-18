@@ -1,8 +1,14 @@
 package dev.dota.etl;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import dev.dota.etl.download.ReplayDownloader;
 import dev.dota.etl.extract.ReplayExtractor;
+import dev.dota.etl.metrics.MetricsRunner;
+import dev.dota.etl.report.PlayerReviewGenerator;
+import dev.dota.etl.report.ReportGenerator;
 import dev.dota.etl.util.AtomicFiles;
+import dev.dota.etl.util.Numbers;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -10,6 +16,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -17,6 +24,11 @@ import java.util.Set;
  *
  * <pre>
  *   dota-replay-etl analyze &lt;matchIdOrFile&gt; [--out DIR] [--cache DIR] [--sample SEC]
+ *   dota-replay-etl pipeline &lt;matchIdOrFile&gt; [--out DIR] [--cache DIR] [--sample SEC]
+ *                     [--report] [--player-review HERO]
+ *   dota-replay-etl metrics &lt;outputDir&gt;
+ *   dota-replay-etl report &lt;outputDir&gt;
+ *   dota-replay-etl player-review &lt;outputDir&gt; &lt;heroOrNameOrIndex&gt;
  *   dota-replay-etl download &lt;matchId&gt; [--out DIR]
  * </pre>
  *
@@ -26,7 +38,7 @@ import java.util.Set;
 public final class Main {
 
     private static final Logger log = LoggerFactory.getLogger(Main.class);
-    private static final com.fasterxml.jackson.databind.ObjectMapper MAPPER = new com.fasterxml.jackson.databind.ObjectMapper();
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     public static void main(String[] args) {
         try {
@@ -50,6 +62,7 @@ public final class Main {
             String cmd = args[0];
             return switch (cmd) {
                 case "analyze" -> analyze(args);
+                case "pipeline" -> pipeline(args);
                 case "metrics" -> metrics(args);
                 case "report" -> report(args);
                 case "player-review" -> playerReview(args);
@@ -76,31 +89,36 @@ public final class Main {
             return 2;
         }
         String input = args[1];
-        Map<String, String> options = options(args, 2, "--out", "--cache", "--sample");
+        Map<String, String> options = options(args, 2, Set.of(), "--out", "--cache", "--sample");
         Path out = value(options, "--out").map(Path::of).orElse(Path.of("out"));
         Path cache = value(options, "--cache").map(Path::of).orElse(Path.of("replays"));
         int sample = value(options, "--sample").map(Main::positiveInt).orElse(1);
+        resolveAndExtract(input, out, cache, sample);
+        return 0;
+    }
 
-        Path dem;
-        if (isDigits(input)) {
-            long matchId = positiveLong(input, "match id");
-            dem = new ReplayDownloader().download(matchId, cache);
-        } else {
-            dem = Path.of(input);
-            if (!Files.isRegularFile(dem)) {
-                log.error("replay file not found: {}", dem.toAbsolutePath());
-                return 1;
-            }
+    private int pipeline(String[] args) throws Exception {
+        if (args.length < 2) {
+            log.error("pipeline requires an input (match id or .dem file path)");
+            return 2;
         }
+        String input = args[1];
+        Map<String, String> options = options(args, 2, Set.of("--report"),
+            "--out", "--cache", "--sample", "--player-review");
+        Path out = value(options, "--out").map(Path::of).orElse(Path.of("out"));
+        Path cache = value(options, "--cache").map(Path::of).orElse(Path.of("replays"));
+        int sample = value(options, "--sample").map(Main::positiveInt).orElse(1);
+        boolean withReport = options.containsKey("--report");
+        String playerSelector = value(options, "--player-review").orElse(null);
 
-        log.info("extracting {}", dem);
-        long t0 = System.currentTimeMillis();
-        ReplayExtractor.Result result = ReplayExtractor.run(dem, out, sample);
-        long elapsedMs = System.currentTimeMillis() - t0;
-        log.info("match {}: {} combat log entries, {} player samples, duration {}s in {}ms",
-            result.matchId(), result.combatLogCount(), result.playersCount(),
-            result.lastTick() / 30, elapsedMs);
-        log.info("output: {}", result.dir().toAbsolutePath());
+        Path dir = resolveAndExtract(input, out, cache, sample);
+        computeMetrics(dir);
+        if (withReport) {
+            generateReport(dir);
+        }
+        if (playerSelector != null) {
+            generatePlayerReview(dir, playerSelector);
+        }
         return 0;
     }
 
@@ -109,27 +127,7 @@ public final class Main {
             log.error("metrics requires an output directory containing the ETL result (e.g. out/6676393091)");
             return 2;
         }
-        Path dir = Path.of(args[1]);
-        Path combat = dir.resolve("combatlog.ndjson");
-        Path players = dir.resolve("players.ndjson");
-        if (!Files.exists(combat) || !Files.exists(players)) {
-            log.error("missing combatlog.ndjson / players.ndjson in {}", dir.toAbsolutePath());
-            return 1;
-        }
-        String matchId = "";
-        Path matchJson = dir.resolve("match.json");
-        if (Files.exists(matchJson)) {
-            var node = MAPPER.readTree(Files.readString(matchJson));
-            matchId = String.valueOf(node.path("match_id").asLong(0));
-        }
-        dev.dota.etl.metrics.MetricsRunner runner = new dev.dota.etl.metrics.MetricsRunner(combat, players);
-        long t0 = System.currentTimeMillis();
-        com.fasterxml.jackson.databind.node.ObjectNode metrics = runner.run();
-        AtomicFiles.writeString(runner.metricsJson(),
-            MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(metrics) + "\n");
-        log.info("match {} metrics written to {} in {}ms",
-            matchId, runner.metricsJson().toAbsolutePath(), System.currentTimeMillis() - t0);
-        log.info("duckdb persisted to {}", runner.dbFile().toAbsolutePath());
+        computeMetrics(Path.of(args[1]));
         return 0;
     }
 
@@ -138,16 +136,7 @@ public final class Main {
             log.error("report requires an output directory containing metrics.json (e.g. out/6676393091)");
             return 2;
         }
-        Path dir = Path.of(args[1]);
-        Path metrics = dir.resolve("metrics.json");
-        if (!Files.exists(metrics)) {
-            log.error("missing metrics.json in {} (run `metrics` first)", dir.toAbsolutePath());
-            return 1;
-        }
-        dev.dota.etl.report.ReportGenerator generator = new dev.dota.etl.report.ReportGenerator(dir);
-        generator.generatePrompt();
-        log.info("prompt written to {}", generator.promptFile().toAbsolutePath());
-        log.info("(dry-run: copy the prompt into any LLM; an API call mode can be added later)");
+        generateReport(Path.of(args[1]));
         return 0;
     }
 
@@ -157,7 +146,7 @@ public final class Main {
             return 2;
         }
         long matchId = positiveLong(args[1], "match id");
-        Map<String, String> options = options(args, 2, "--out");
+        Map<String, String> options = options(args, 2, Set.of(), "--out");
         Path out = value(options, "--out").map(Path::of).orElse(Path.of("replays"));
         Path dem = new ReplayDownloader().download(matchId, out);
         log.info("downloaded {}", dem.toAbsolutePath());
@@ -170,27 +159,98 @@ public final class Main {
                 "(hero/name/player index, e.g. out/8943544578 slark)");
             return 2;
         }
-        Path dir = Path.of(args[1]);
-        if (!Files.exists(dir.resolve("metrics.json"))) {
-            log.error("missing metrics.json in {} (run `metrics` first)", dir.toAbsolutePath());
-            return 1;
+        generatePlayerReview(Path.of(args[1]), args[2]);
+        return 0;
+    }
+
+    // ------------------------------------------------------------------
+    // shared pipeline stages
+    // ------------------------------------------------------------------
+
+    private static Path resolveAndExtract(String input, Path out, Path cache, int sample) throws Exception {
+        Path dem;
+        if (Numbers.isDigits(input)) {
+            long matchId = positiveLong(input, "match id");
+            dem = new ReplayDownloader().download(matchId, cache);
+        } else {
+            dem = Path.of(input);
+            if (!Files.isRegularFile(dem)) {
+                throw new IllegalArgumentException("replay file not found: " + dem.toAbsolutePath());
+            }
         }
-        dev.dota.etl.report.PlayerReviewGenerator generator =
-            new dev.dota.etl.report.PlayerReviewGenerator(dir, args[2]);
+
+        log.info("extracting {}", dem);
+        long t0 = System.currentTimeMillis();
+        ReplayExtractor.Result result = ReplayExtractor.run(dem, out, sample);
+        long elapsedMs = System.currentTimeMillis() - t0;
+        log.info("match {}: {} combat log entries, {} player samples, duration {}s in {}ms",
+            result.matchId(), result.combatLogCount(), result.playersCount(),
+            result.lastTick() / 30, elapsedMs);
+        log.info("output: {}", result.dir().toAbsolutePath());
+        return result.dir();
+    }
+
+    private static ObjectNode computeMetrics(Path dir) throws Exception {
+        Path combat = dir.resolve("combatlog.ndjson");
+        Path players = dir.resolve("players.ndjson");
+        if (!Files.exists(combat) || !Files.exists(players)) {
+            throw new IllegalArgumentException(
+                "missing combatlog.ndjson / players.ndjson in " + dir.toAbsolutePath());
+        }
+        String matchId = "";
+        Path matchJson = dir.resolve("match.json");
+        if (Files.exists(matchJson)) {
+            var node = MAPPER.readTree(Files.readString(matchJson));
+            matchId = String.valueOf(node.path("match_id").asLong(0));
+        }
+        MetricsRunner runner = new MetricsRunner(combat, players);
+        long t0 = System.currentTimeMillis();
+        ObjectNode metrics = runner.run();
+        AtomicFiles.writeString(runner.metricsJson(),
+            MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(metrics) + "\n");
+        log.info("match {} metrics written to {} in {}ms",
+            matchId, runner.metricsJson().toAbsolutePath(), System.currentTimeMillis() - t0);
+        log.info("duckdb persisted to {}", runner.dbFile().toAbsolutePath());
+        return metrics;
+    }
+
+    private static void generateReport(Path dir) throws Exception {
+        if (!Files.exists(dir.resolve("metrics.json"))) {
+            throw new IllegalArgumentException(
+                "missing metrics.json in " + dir.toAbsolutePath() + " (run `metrics` first)");
+        }
+        ReportGenerator generator = new ReportGenerator(dir);
+        generator.generatePrompt();
+        log.info("prompt written to {}", generator.promptFile().toAbsolutePath());
+        log.info("(dry-run: copy the prompt into any LLM; an API call mode can be added later)");
+    }
+
+    private static void generatePlayerReview(Path dir, String selector) throws Exception {
+        if (!Files.exists(dir.resolve("metrics.json"))) {
+            throw new IllegalArgumentException(
+                "missing metrics.json in " + dir.toAbsolutePath() + " (run `metrics` first)");
+        }
+        PlayerReviewGenerator generator = new PlayerReviewGenerator(dir, selector);
         String prompt = generator.generatePrompt();
         log.info("player review prompt written to {}", generator.promptFile().toAbsolutePath());
         log.info("prompt length {} chars (dry-run: copy the prompt into any LLM)",
             prompt.length());
-        return 0;
     }
 
-    private static Map<String, String> options(String[] args, int start, String... allowedNames) {
+    private static Map<String, String> options(String[] args, int start, Set<String> flags,
+                                               String... allowedNames) {
         Set<String> allowed = Set.of(allowedNames);
         Map<String, String> values = new HashMap<>();
-        for (int i = start; i < args.length; i += 2) {
+        for (int i = start; i < args.length; i++) {
             String name = args[i];
             if (!allowed.contains(name)) {
                 throw new IllegalArgumentException("unknown option or unexpected argument '" + name + "'");
+            }
+            if (flags.contains(name)) {
+                if (values.putIfAbsent(name, "true") != null) {
+                    throw new IllegalArgumentException("option " + name + " was specified more than once");
+                }
+                continue;
             }
             if (i + 1 >= args.length || args[i + 1].startsWith("--")) {
                 throw new IllegalArgumentException("option " + name + " requires a value");
@@ -198,12 +258,13 @@ public final class Main {
             if (values.putIfAbsent(name, args[i + 1]) != null) {
                 throw new IllegalArgumentException("option " + name + " was specified more than once");
             }
+            i++;
         }
         return values;
     }
 
-    private static java.util.Optional<String> value(Map<String, String> options, String name) {
-        return java.util.Optional.ofNullable(options.get(name));
+    private static Optional<String> value(Map<String, String> options, String name) {
+        return Optional.ofNullable(options.get(name));
     }
 
     private static int positiveInt(String value) {
@@ -226,10 +287,6 @@ public final class Main {
         }
     }
 
-    private static boolean isDigits(String s) {
-        return !s.isEmpty() && s.chars().allMatch(Character::isDigit);
-    }
-
     private static void usage() {
         System.out.println("""
             dota-replay-etl - Dota 2 .dem replay ETL
@@ -241,6 +298,12 @@ public final class Main {
                   --out     output directory (default: ./out)
                   --cache   replay cache directory (default: ./replays)
                   --sample  player state sampling interval in seconds (default: 1)
+
+              dota-replay-etl pipeline <matchIdOrFile> [--out DIR] [--cache DIR] [--sample SEC]
+                             [--report] [--player-review HERO]
+                  Extract + compute metrics in one step. Flags:
+                  --report           also assemble prompt.md (dry-run)
+                  --player-review H  also assemble player-review-<hero>.md (dry-run)
 
               dota-replay-etl metrics <outputDir>
                   Compute match metrics (roster, kills, teamfights, gold/xp curves, items)

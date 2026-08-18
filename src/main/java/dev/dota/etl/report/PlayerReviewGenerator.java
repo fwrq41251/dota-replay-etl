@@ -3,6 +3,7 @@ package dev.dota.etl.report;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.dota.etl.util.AtomicFiles;
+import dev.dota.etl.util.Numbers;
 
 import java.io.BufferedReader;
 import java.nio.file.Files;
@@ -323,8 +324,8 @@ public final class PlayerReviewGenerator {
         Integer overtakeMin = null;
         for (int min = 0; min * 60.0 <= lastT + 60; min++) {
             double t = min * 60.0;
-            double v = lastAtOrBefore(mine, t);
-            double ev = enemyTop == null ? 0 : lastAtOrBefore(cum.get(enemyTop), t);
+            double v = ReportGenerator.lastAtOrBefore(mine, t);
+            double ev = enemyTop == null ? 0 : ReportGenerator.lastAtOrBefore(cum.get(enemyTop), t);
             if (overtakeMin == null && enemyTop != null && ev > v) {
                 overtakeMin = min;
             }
@@ -339,8 +340,8 @@ public final class PlayerReviewGenerator {
         }
         if (mine.size() >= 2) {
             double tMin = Math.max(0, lastT - 3 * 60.0);
-            double vStart = lastAtOrBefore(mine, tMin);
-            double vEnd = lastAtOrBefore(mine, lastT);
+            double vStart = ReportGenerator.lastAtOrBefore(mine, tMin);
+            double vEnd = ReportGenerator.lastAtOrBefore(mine, lastT);
             if (vEnd - vStart < 500) {
                 sb.append("**事实提取**：最后约 3 分钟内累计收入仅增长 ").append((long) (vEnd - vStart))
                   .append("，近乎停滞。\n");
@@ -585,7 +586,7 @@ public final class PlayerReviewGenerator {
     private JsonNode resolveTarget(JsonNode metrics) {
         List<JsonNode> roster = new ArrayList<>();
         metrics.path("roster").forEach(roster::add);
-        if (isDigits(selector)) {
+        if (Numbers.isDigits(selector)) {
             int idx = Integer.parseInt(selector);
             for (JsonNode p : roster) {
                 if (p.path("player").asInt() == idx) {
@@ -637,25 +638,5 @@ public final class PlayerReviewGenerator {
             }
         }
         return best;
-    }
-
-    private static double lastAtOrBefore(List<double[]> pts, double t) {
-        int lo = 0;
-        int hi = pts.size() - 1;
-        int ans = -1;
-        while (lo <= hi) {
-            int mid = (lo + hi) >>> 1;
-            if (pts.get(mid)[0] <= t) {
-                ans = mid;
-                lo = mid + 1;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        return ans < 0 ? 0 : pts.get(ans)[1];
-    }
-
-    private static boolean isDigits(String s) {
-        return !s.isEmpty() && s.chars().allMatch(Character::isDigit);
     }
 }

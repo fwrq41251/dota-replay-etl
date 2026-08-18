@@ -200,7 +200,7 @@ public final class ReportGenerator {
         sb.append("。\n\n");
     }
 
-    private static double lastAtOrBefore(List<double[]> pts, double t) {
+    static double lastAtOrBefore(List<double[]> pts, double t) {
         int lo = 0;
         int hi = pts.size() - 1;
         int ans = -1;
@@ -286,8 +286,6 @@ public final class ReportGenerator {
               .append('|');
             if (radDeaths == direDeaths) {
                 sb.append("阵亡数相同");
-            } else if (radDeaths > direDeaths) {
-                sb.append("天辉 ").append(radDeaths).append(" / 夜魇 ").append(direDeaths);
             } else {
                 sb.append("天辉 ").append(radDeaths).append(" / 夜魇 ").append(direDeaths);
             }
