@@ -86,6 +86,12 @@ class PlayerReviewGeneratorTest {
         dmg2.put("hero", "axe").put("dealt_total", 700).put("taken_total", 900);
         dmg2.putArray("per_minute");
 
+        ArrayNode farm = metrics.putArray("farm_curves");
+        ObjectNode fc = farm.addObject();
+        fc.put("hero", "pudge");
+        ArrayNode fpts = fc.putArray("points");
+        fpts.addObject().put("t", 90.0).put("total_earned_gold", 800).put("last_hits", 6).put("denies", 1);
+
         Path metricsJson = dir.resolve("metrics.json");
         Files.writeString(metricsJson, MAPPER.writeValueAsString(metrics));
         Path matchJson = dir.resolve("match.json");
@@ -127,6 +133,7 @@ class PlayerReviewGeneratorTest {
         assertTrue(prompt.contains("有实质参与的交战窗口"), "teamfight section");
         assertTrue(prompt.contains("个人输出/承伤"), "personal fight evidence");
         assertTrue(prompt.contains("打钱/位置分析"), "position section");
+        assertTrue(prompt.contains("累计获得金币 800，补刀 6（1.2/分钟），反补 1"), "farm totals line");
         assertTrue(prompt.contains("100%"), "enemy half percentage");
         assertTrue(prompt.contains("出装决策"), "question 1");
         assertTrue(prompt.contains("改进优先级"), "question 5");

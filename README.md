@@ -150,8 +150,9 @@ One row per player per sample:
 DuckDB, computes the metrics below, and writes `metrics.json` plus a persistent
 `metrics.duckdb`. The DuckDB file exposes the raw streams (`combatlog`, `players`,
 `kills`, `hero_damage`) and every computed metric as a table (`gold_curves`, `xp_curves`,
-`item_timeline`, `damage`, `damage_per_minute`, `teamfights`) built from the same SQL
-that drives the JSON sections, so ad-hoc SQL sees exactly the metrics the reports use.
+`item_timeline`, `damage`, `damage_per_minute`, `teamfights`, `teamfight_economy`) built
+from the same SQL that drives the JSON sections, so ad-hoc SQL sees exactly the metrics
+the reports use.
 The inputs are validated up front: if a critical column (`t`, `type`, hero names/keys,
 teams, `value`, ...) is missing from either NDJSON file, the command fails with a clear
 error instead of producing silently wrong metrics (re-run `analyze` to regenerate).
@@ -170,17 +171,29 @@ official hero-kill counter (with final roster deaths as a fallback for older ext
     "roshan_kills": 2
   },
   "roster": [ {"player": 0, "name": "xiao8", "hero": "LoneDruid", "hero_key": "lone_druid", "team": 2,
-               "side": "radiant", "level": 25, "kills": 3, "deaths": 3, "assists": 9} ],
+               "side": "radiant", "level": 25, "kills": 3, "deaths": 3, "assists": 9,
+               "lane": "top", "lane_confidence": 94} ],
   "kills": [ { "t": 884.9, "killer": "...", "killer_key": "marci", "victim": "...", "victim_key": "lone_druid",
                "killer_team": 3, "victim_team": 2, "location": [-6111.0, -5903.0], "victim_networth": 870,
                "assist_players": [9, 8, 5] } ],
   "teamfights": [ { "id": 0, "start": 880.0, "end": 885.0, "duration": 5.0, "hero_damage": 750, "deaths": 1,
-                    "participants": ["ember_spirit", "enchantress", "lone_druid", ...] } ],
+                    "participants": ["ember_spirit", "enchantress", "lone_druid", ...],
+                    "economy": { "radiant": {"gold": 250, "xp": 180}, "dire": {"gold": 100, "xp": 60},
+                                 "gold_delta": 150, "xp_delta": 120 } } ],
   "gold_curves": [ { "hero": "lone_druid", "points": [ {"t": 795.0, "gold": 600}, ... ] } ],
   "xp_curves": [ { "hero": "lone_druid", "points": [ {"t": 795.0, "xp": 0}, ... ] } ],
   "item_timeline": [ { "hero": "marci", "items": [ {"item": "item_orb_of_venom", "t": 827.5}, ... ] } ],
   "damage": [ { "hero": "lone_druid", "dealt_total": 25000, "taken_total": 18000,
-                "per_minute": [ {"min": 13, "dealt": 800}, ... ] } ]
+                "per_minute": [ {"min": 13, "dealt": 800}, ... ] } ],
+  "objectives": {
+    "roshan_kills": [ { "t": 2679.0, "killer": "npc_dota_hero_drow_ranger", "killer_key": "drow_ranger",
+                        "team": 2, "side": "radiant" } ],
+    "building_kills": [ { "t": 1147.0, "building": "npc_dota_badguys_tower1_top", "building_key": "badguys_tower1_top",
+                          "kind": "tower", "owner_team": 3, "owner_side": "dire",
+                          "destroyer_team": 2, "destroyer_side": "radiant" } ]
+  },
+  "farm_curves": [ { "hero": "drow_ranger", "points": [ { "t": 30.0, "total_earned_gold": 600, "last_hits": 0, "denies": 0 },
+                                                         { "t": 90.0, "total_earned_gold": 820, "last_hits": 7, "denies": 1 }, ... ] } ]
 }
 ```
 
@@ -190,14 +203,35 @@ Notes:
   also records creep / tower / neutral deaths).
 - Hero keys are normalised snake_case (`npc_dota_hero_lone_druid` -> `lone_druid`) so the
   combat-log-derived sections join with `roster.hero_key`.
+- Each roster entry carries an inferred `lane` (`top` / `mid` / `bottom`) plus `lane_confidence`
+  (percentage of early samples matching the winning region). Lane inference is **inferential,
+  not factual**: it takes each player's positions during the first 90 seconds after the horn,
+  assigns every sample to the top (`x < 0, y > 0`), bottom (`x > 0, y < 0`) or mid (x,y same sign)
+  map region, and picks the region holding the majority (fountain trips excluded, min 10 samples).
+  The reports label this as 推断 and quote the confidence.
 - `gold_curves` / `xp_curves` are cumulative sums of combat-log GOLD / XP events per hero,
   bucketed every 30 / 60 s (bucket centre time). Gold starts at 600 (starting gold).
 - `item_timeline` retains every purchase event, including repeated purchases of the same item.
 - `teamfights` are runs of 5-second activity buckets where
   `damage_events + 4*deaths >= 8`, where `damage_events` counts **hero-to-hero** damage
   (attacker and target are both heroes) and `deaths` are hero deaths. `hero_damage` in each
-  episode counts damage dealt *by* heroes. The knobs (`BUCKET_SEC`, `WEIGHT_DEATH`,
+  episode counts damage dealt *by* heroes. Each episode also carries an `economy` object:
+  the net gold / XP gained by each team's heroes inside the window (summed from combat-log
+  GOLD / XP events attributed via hero -> team; buyback costs count as negative gold,
+  building / Roshan gold is excluded), plus `gold_delta` / `xp_delta` as radiant minus dire.
+  The knobs (`BUCKET_SEC`, `WEIGHT_DEATH`,
   `MIN_ACTIVE_SCORE`) live at the top of `MetricsRunner`.
+- `objectives` is the objective timeline. `roshan_kills` lists every Roshan death with its time,
+  the last-hitting hero and the killing team. `building_kills` lists every
+  `DOTA_COMBATLOG_TEAM_BUILDING_KILL`: time, building entity, `kind` (`tower` / `rax` / `ancient`
+  / `base_tower` / `other`), owner team and destroying team (the fort / ancient death ends the
+  game). Building deaths are **facts** — the engine reports who destroyed whose, so reports can
+  correlate fights with objectives without the model guessing.
+- `farm_curves` comes straight from the authoritative player resource (`CDOTA_PlayerResource`),
+  not reconstructed from GOLD events: per hero, cumulative `total_earned_gold`, `last_hits` and
+  `denies`, bucketed every 60 s (bucket centre time, MAX per bucket keeps the monotonic counters
+  after resets). Reports quote these as facts (e.g. final totals, last-hits-per-minute) instead of
+  labelling the combat-log income curve as a "bank balance".
 - `damage` is per-hero hero-to-hero damage: `dealt_total` (attacker is a hero), `taken_total`
   (target is a hero, any source), and `per_minute` buckets of damage dealt. Drives the
   single-player review's engagement windows.
@@ -209,8 +243,17 @@ review prompt into `prompt.md` (dry-run only — it never calls an LLM). All num
 pre-computed by the metrics layer; the prompt explicitly forbids the model from inventing or
 recalculating values, and asks it to close with an **MVP** and a **lowest role-completion** pick, each
 with data-backed reasons (the lower-performer pick may be declined when evidence is insufficient).
+The lineup table shows each player's inferred lane with its confidence (labelled as 推断).
 The economy section shows the five-minute team income differential
-(carry-forward of each hero's cumulative income, labelled as a trend, not a bank balance).
+(carry-forward of each hero's cumulative income, labelled as a trend, not a bank balance),
+followed by an authoritative per-hero farm table (total earned gold, last hits, denies,
+last-hits-per-minute) from the player resource.
+The fight timeline includes each window's per-team gold change (see `teamfight.economy`),
+so "who won the fight" is a data-backed claim rather than a death-exchange guess.
+A new **客观目标时间线** section lists every Roshan kill (time + killer + team) and every
+building kill (time + building + destroying team) in game-clock order, so "this teamfight
+converted into a tower / Roshan / throne" becomes a factual claim. The final ancient kill
+marks the end of the game.
 Copy `prompt.md` into any LLM to get the report, or paste it into a future `--api` mode.
 
 ## Single-player review (`player-review`)
@@ -221,10 +264,16 @@ roster entry by `hero_key`, hero name, player name, or player index. Beyond the 
 metrics it adds: the hero's full purchase timeline, kills/deaths with positions, an income
 comparison against the enemy team's top earner (with auto-detected overtake / stall facts),
 per-minute hero damage, the fights the hero actually participated in (with kill/death outcome
-per fight), and a farming/position table derived from `players.ndjson` (share of time spent in
-the enemy half and deep in enemy territory per game phase, split along the river diagonal).
+and per-team gold change per fight), and a farming/position table derived from `players.ndjson`
+(the hero's inferred lane with its confidence is shown at the top; the table reports the share
+of time spent in the enemy half and deep in enemy territory per game phase, split along the
+river diagonal).
 It also includes each death's preceding 15-second cast, control, damage-source, and last-BKB-use
-evidence, plus per-fight personal damage dealt/taken. The prompt asks for a data-backed review of
+evidence, plus per-fight personal damage dealt/taken. The 打钱/位置分析 section opens with the
+hero's authoritative farm totals (cumulative earned gold, last hits + per-minute pace, denies)
+from the player resource. A **本方目标进度** section lists the
+Roshan kills and building destroys performed by the hero's team, so the review can judge whether
+kills converted into objectives. The prompt asks for a data-backed review of
 出装决策 / 团战切入 / 打钱路线 / 关键决策 plus a
 prioritised improvement list. Position facts are skipped when `players.ndjson` is absent.
 

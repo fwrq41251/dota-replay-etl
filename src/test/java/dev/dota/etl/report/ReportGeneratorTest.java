@@ -89,7 +89,7 @@ class ReportGeneratorTest {
         assertTrue(prompt.contains("12345"), "match id");
         assertTrue(prompt.contains("天辉 6"), "score");
         assertTrue(prompt.contains("胜方：未知（不得由比分推断）"), "does not infer winner from score");
-        assertTrue(prompt.contains("|alice|Pudge|6/1/5|12|"), "roster row");
+        assertTrue(prompt.contains("|alice|Pudge|-|6/1/5|12|"), "roster row");
         assertTrue(prompt.contains("经济差（天辉 - 夜魇"), "economy label");
         assertTrue(prompt.contains("pudge"), "kill row");
         assertTrue(prompt.contains("blinkdagger"), "key item");

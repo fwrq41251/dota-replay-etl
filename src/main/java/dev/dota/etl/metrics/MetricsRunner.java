@@ -50,6 +50,11 @@ public final class MetricsRunner {
     private static final double WEIGHT_DEATH = 4.0;
     private static final double MIN_ACTIVE_SCORE = 8.0;
 
+    // lane inference knobs (early-game position clustering, see computeLanes)
+    private static final int LANE_WINDOW_SEC = 90;
+    private static final double FOUNTAIN_RADIUS = 5300;
+    private static final int MIN_LANE_SAMPLES = 10;
+
     /**
      * Columns the metrics layer relies on for correct results. A missing column would silently
      * turn into NULL (skipped filters / zero sums), so the NDJSON inputs are validated up front
@@ -59,7 +64,8 @@ public final class MetricsRunner {
         "t", "type", "attacker", "target", "attacker_hero", "target_hero",
         "attacker_team", "target_team", "value");
     private static final List<String> REQUIRED_PLAYERS_COLUMNS = List.of(
-        "t", "tick", "player", "team", "hero", "name", "level", "kills", "deaths", "assists");
+        "t", "tick", "player", "team", "hero", "name", "level", "kills", "deaths", "assists",
+        "total_earned_gold", "last_hits", "denies");
 
     private final Path combatLog;
     private final Path players;
@@ -122,6 +128,8 @@ public final class MetricsRunner {
                 addRoster(conn, metrics);
                 addKills(conn, metrics);
                 addTeamfights(conn, metrics);
+                addObjectives(conn, metrics);
+                addFarmCurves(conn, metrics);
                 addGoldCurves(conn, metrics);
                 addXpCurves(conn, metrics);
                 addItemTimeline(conn, metrics);
@@ -199,6 +207,7 @@ public final class MetricsRunner {
     }
 
     private void addRoster(Connection conn, ObjectNode root) throws Exception {
+        Map<Integer, String[]> lanes = computeLanes(conn);
         ArrayNode arr = root.putArray("roster");
         queryMaps(conn, """
             SELECT player, name, hero, hero_key, team, "level", kills, deaths, assists FROM (
@@ -219,7 +228,60 @@ public final class MetricsRunner {
             p.put("kills", longOf(row.get("kills")));
             p.put("deaths", longOf(row.get("deaths")));
             p.put("assists", longOf(row.get("assists")));
+            String[] lane = lanes.get(intOf(row.get("player")));
+            if (lane != null) {
+                p.put("lane", lane[0]);
+                p.put("lane_confidence", Integer.parseInt(lane[1]));
+            }
         });
+    }
+
+    /**
+     * Lane inference from the first {@value LANE_WINDOW_SEC} seconds after the horn: each player's
+     * samples are assigned to the top (x &lt; 0, y &gt; 0), bottom (x &gt; 0, y &lt; 0) or mid (x,y same sign)
+     * map region; the region holding the majority of samples wins. Fountain trips are excluded and the
+     * majority share is reported as a confidence percentage. Purely inferential (labelled as such in the
+     * reports) — the map layout is validated empirically (radiant fountain &asymp; (-6700, -6700)).
+     */
+    private Map<Integer, String[]> computeLanes(Connection conn) throws Exception {
+        Map<Integer, String[]> lanes = new LinkedHashMap<>();
+        for (Map<String, Object> row : queryMaps(conn, laneSql())) {
+            int player = intOf(row.get("player"));
+            long n = longOf(row.get("n"));
+            if (n < MIN_LANE_SAMPLES) {
+                continue;
+            }
+            long bottom = longOf(row.get("bottom_n"));
+            long top = longOf(row.get("top_n"));
+            long mid = longOf(row.get("mid_n"));
+            String lane;
+            if (bottom >= top && bottom >= mid) {
+                lane = "bottom";
+            } else if (top >= bottom && top >= mid) {
+                lane = "top";
+            } else {
+                lane = "mid";
+            }
+            long conf = Math.round(100.0 * Math.max(bottom, Math.max(top, mid)) / n);
+            lanes.put(player, new String[]{lane, String.valueOf(conf)});
+        }
+        return lanes;
+    }
+
+    private static String laneSql() {
+        return ("""
+            SELECT player, COUNT(*) AS n,
+                   SUM(CASE WHEN x > 0 AND y < 0 THEN 1 ELSE 0 END) AS bottom_n,
+                   SUM(CASE WHEN x < 0 AND y > 0 THEN 1 ELSE 0 END) AS top_n,
+                   SUM(CASE WHEN (x > 0 AND y > 0) OR (x < 0 AND y < 0) THEN 1 ELSE 0 END) AS mid_n
+            FROM players_v
+            WHERE t >= 0 AND t <= %d AND team IN (2, 3)
+              AND NOT (hp IS NOT NULL AND hp <= 0)
+              AND x IS NOT NULL AND y IS NOT NULL AND x <> 0 AND y <> 0
+              AND NOT ((team = 2 AND x < -%d AND y < -%d) OR (team = 3 AND x > %d AND y > %d))
+            GROUP BY player
+            """).formatted(LANE_WINDOW_SEC, (long) FOUNTAIN_RADIUS, (long) FOUNTAIN_RADIUS,
+            (long) FOUNTAIN_RADIUS, (long) FOUNTAIN_RADIUS);
     }
 
     private void addKills(Connection conn, ObjectNode root) throws Exception {
@@ -256,8 +318,17 @@ public final class MetricsRunner {
     }
 
     private void addTeamfights(Connection conn, ObjectNode root) throws Exception {
+        // shared with persistTables so the persisted tables mirror the JSON exactly
+        conn.createStatement().execute("""
+            CREATE TEMP TABLE hero_team AS
+            SELECT hero_key, team FROM (
+              SELECT hero_key, team, ROW_NUMBER() OVER (PARTITION BY hero_key ORDER BY tick DESC) rn
+              FROM players_v WHERE hero_key IS NOT NULL AND team IN (2, 3)
+            ) WHERE rn = 1
+            """);
+        conn.createStatement().execute("CREATE TEMP TABLE tf_episodes AS " + teamfightEpisodesSql());
         ArrayNode arr = root.putArray("teamfights");
-        for (Object[] row : query(conn, teamfightEpisodesSql())) {
+        for (Object[] row : query(conn, "SELECT id, start, \"end\", hero_damage, deaths FROM tf_episodes ORDER BY start")) {
             int id = intOf(row[0]);
             double start = dbl(row[1]);
             double end = dbl(row[2]);
@@ -270,6 +341,7 @@ public final class MetricsRunner {
             tf.put("deaths", longOf(row[4]));
 
             List<Object[]> events = query(conn, teamfightEventsSql().formatted(start, end));
+            addEconomy(conn, tf, start, end);
             Set<String> participants = new LinkedHashSet<>();
             Map<String, double[]> playerStats = new LinkedHashMap<>();
             for (Object[] event : events) {
@@ -364,6 +436,171 @@ public final class MetricsRunner {
                   (type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND attacker LIKE 'npc_dota_hero_%%') OR
                   (type='DOTA_COMBATLOG_DEATH' AND target_hero) OR
                   (type='DOTA_COMBATLOG_HEAL' AND target_hero AND attacker LIKE 'npc_dota_hero_%%'))
+            """;
+    }
+
+    /** Gold / XP each team's heroes gained inside a fight window, attributed via hero -> team. */
+    private void addEconomy(Connection conn, ObjectNode tf, double start, double end) throws Exception {
+        long radGold = 0, radXp = 0, direGold = 0, direXp = 0;
+        for (Object[] row : query(conn, teamfightEconomySql().formatted(start, end))) {
+            int team = intOf(row[0]);
+            if (team == 2) {
+                radGold = longOf(row[1]);
+                radXp = longOf(row[2]);
+            } else if (team == 3) {
+                direGold = longOf(row[1]);
+                direXp = longOf(row[2]);
+            }
+        }
+        ObjectNode eco = tf.putObject("economy");
+        ObjectNode radiant = eco.putObject("radiant");
+        radiant.put("gold", radGold);
+        radiant.put("xp", radXp);
+        ObjectNode dire = eco.putObject("dire");
+        dire.put("gold", direGold);
+        dire.put("xp", direXp);
+        eco.put("gold_delta", radGold - direGold);
+        eco.put("xp_delta", radXp - direXp);
+    }
+
+    /** Per-team gold/XP sum for one fight window ({@code %f} start, end). */
+    private static String teamfightEconomySql() {
+        return """
+            SELECT ht.team,
+                   SUM(CASE WHEN c.type = 'DOTA_COMBATLOG_GOLD' THEN c.value END) AS gold,
+                   SUM(CASE WHEN c.type = 'DOTA_COMBATLOG_XP' THEN c.value END) AS xp
+            FROM combatlog_v c
+            JOIN hero_team ht ON ht.hero_key = c.target_key
+            WHERE c.t >= %f AND c.t <= %f
+              AND c.type IN ('DOTA_COMBATLOG_GOLD', 'DOTA_COMBATLOG_XP')
+            GROUP BY ht.team
+            """;
+    }
+
+    /** Same attribution as {@link #teamfightEconomySql()} but for every episode (persisted table). */
+    private static String teamfightEconomyPersistSql() {
+        return """
+            SELECT e.id, ht.team,
+                   COALESCE(SUM(CASE WHEN c.type = 'DOTA_COMBATLOG_GOLD' THEN c.value END), 0) AS gold,
+                   COALESCE(SUM(CASE WHEN c.type = 'DOTA_COMBATLOG_XP' THEN c.value END), 0) AS xp
+            FROM tf_episodes e
+            JOIN combatlog_v c ON c.t >= e.start AND c.t <= e."end"
+              AND c.type IN ('DOTA_COMBATLOG_GOLD', 'DOTA_COMBATLOG_XP')
+            JOIN hero_team ht ON ht.hero_key = c.target_key
+            GROUP BY e.id, ht.team ORDER BY e.id, ht.team
+            """;
+    }
+
+    /**
+     * Objective timeline: roshan kills (who got the last hit, when) and building kills (towers / rax /
+     * ancient / base towers, who destroyed whose). Every building kill is reported by the engine as
+     * {@code DOTA_COMBATLOG_TEAM_BUILDING_KILL} with the destroying team in {@code attacker_team} and the
+     * owner in {@code target_team}; the fort (ancient) death ends the game.
+     */
+    private void addObjectives(Connection conn, ObjectNode root) throws Exception {
+        ObjectNode obj = root.putObject("objectives");
+        ArrayNode rosh = obj.putArray("roshan_kills");
+        queryMaps(conn, """
+            SELECT t, attacker, attacker_key, attacker_team
+            FROM combatlog_v
+            WHERE type = 'DOTA_COMBATLOG_DEATH' AND target LIKE 'npc_dota_roshan%'
+            ORDER BY t
+            """).forEach(row -> {
+            ObjectNode r = rosh.addObject();
+            r.put("t", round1(dbl(row.get("t"))));
+            putStr(r, "killer", (String) row.get("attacker"));
+            putStr(r, "killer_key", (String) row.get("attacker_key"));
+            int team = intOf(row.get("attacker_team"));
+            r.put("team", team);
+            r.put("side", teamSide(team));
+        });
+        ArrayNode bld = obj.putArray("building_kills");
+        queryMaps(conn, """
+            SELECT t, target, target_team, attacker_team
+            FROM combatlog_v
+            WHERE type = 'DOTA_COMBATLOG_TEAM_BUILDING_KILL'
+            ORDER BY t
+            """).forEach(row -> {
+            ObjectNode b = bld.addObject();
+            b.put("t", round1(dbl(row.get("t"))));
+            String target = (String) row.get("target");
+            putStr(b, "building", target);
+            if (target != null) {
+                putStr(b, "building_key", target.replace("npc_dota_", ""));
+                putStr(b, "kind", buildingKind(target));
+            }
+            int owner = intOf(row.get("target_team"));
+            b.put("owner_team", owner);
+            b.put("owner_side", teamSide(owner));
+            int destroyer = intOf(row.get("attacker_team"));
+            b.put("destroyer_team", destroyer);
+            b.put("destroyer_side", teamSide(destroyer));
+        });
+    }
+
+    private static String buildingKind(String target) {
+        String key = target.replace("npc_dota_", "");
+        if (key.contains("tower")) {
+            return "tower";
+        }
+        if (key.contains("rax")) {
+            return "rax";
+        }
+        if (key.contains("fort")) {
+            return "ancient";
+        }
+        if (key.contains("fillers")) {
+            return "base_tower";
+        }
+        return "other";
+    }
+
+    /**
+     * Farm curves straight from the authoritative player resource (CDOTA_PlayerResource): cumulative
+     * earned gold, last hits and denies per hero, bucketed every 60 s. Unlike the combat-log-derived
+     * {@code gold_curves} (which reconstructs income from GOLD events), these values are the engine's
+     * own counters, so the reports can quote them as facts rather than labelled trends.
+     */
+    private void addFarmCurves(Connection conn, ObjectNode root) throws Exception {
+        ArrayNode arr = root.putArray("farm_curves");
+        String curHero = null;
+        ArrayNode points = null;
+        for (Object[] row : query(conn, farmCurvesSql())) {
+            String hero = (String) row[0];
+            if (!hero.equals(curHero)) {
+                if (points != null && !points.isEmpty()) {
+                    ObjectNode entry = arr.addObject();
+                    entry.put("hero", curHero);
+                    entry.set("points", points);
+                }
+                curHero = hero;
+                points = arr.arrayNode();
+            }
+            ObjectNode pt = points.addObject();
+            pt.put("t", Math.round((dbl(row[1]) + 0.5) * 60));
+            pt.put("total_earned_gold", longOf(row[2]));
+            pt.put("last_hits", longOf(row[3]));
+            pt.put("denies", longOf(row[4]));
+        }
+        if (points != null && !points.isEmpty()) {
+            ObjectNode entry = arr.addObject();
+            entry.put("hero", curHero);
+            entry.set("points", points);
+        }
+    }
+
+    /** One point per hero per 60 s bucket; MAX keeps the monotonic cumulative counters after resets. */
+    private static String farmCurvesSql() {
+        return """
+            SELECT hero_key AS hero, bucket,
+                   MAX(total_earned_gold) AS gold, MAX(last_hits) AS lh, MAX(denies) AS denies
+            FROM (
+              SELECT hero_key, t, total_earned_gold, last_hits, denies, FLOOR(t / 60.0) AS bucket
+              FROM players_v
+              WHERE hero_key IS NOT NULL AND team IN (2, 3)
+                AND total_earned_gold IS NOT NULL AND last_hits IS NOT NULL AND denies IS NOT NULL
+            )
+            GROUP BY hero, bucket ORDER BY hero, bucket
             """;
     }
 
@@ -527,7 +764,13 @@ public final class MetricsRunner {
             st.execute("CREATE OR REPLACE TABLE out.item_timeline AS " + itemTimelineSql());
             st.execute("CREATE OR REPLACE TABLE out.damage_per_minute AS " + damagePerMinuteSql());
             st.execute("CREATE OR REPLACE TABLE out.damage AS " + damageTotalsSql());
-            st.execute("CREATE OR REPLACE TABLE out.teamfights AS " + teamfightEpisodesSql());
+            st.execute("CREATE OR REPLACE TABLE out.teamfights AS SELECT * FROM tf_episodes");
+            st.execute("CREATE OR REPLACE TABLE out.teamfight_economy AS " + teamfightEconomyPersistSql());
+            st.execute("CREATE OR REPLACE TABLE out.roshan_kills AS SELECT t, attacker, attacker_key, " +
+                "attacker_team FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target LIKE 'npc_dota_roshan%'");
+            st.execute("CREATE OR REPLACE TABLE out.building_kills AS SELECT t, target, target_team, " +
+                "attacker_team FROM combatlog_v WHERE type='DOTA_COMBATLOG_TEAM_BUILDING_KILL'");
+            st.execute("CREATE OR REPLACE TABLE out.farm_curves AS " + farmCurvesSql());
         }
     }
 

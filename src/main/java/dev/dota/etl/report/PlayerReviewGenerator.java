@@ -80,6 +80,7 @@ public final class PlayerReviewGenerator {
         appendDamage(sb, metrics, heroKey);
         appendTeamfights(sb, metrics, heroKey);
         appendPosition(sb, metrics, target);
+        appendTeamObjectives(sb, metrics, target);
         appendQuestions(sb);
 
         Files.createDirectories(outFile.getParent());
@@ -436,8 +437,9 @@ public final class PlayerReviewGenerator {
         mine.removeIf(f -> !notableIds.containsKey(f.path("id").asInt()));
         sb.append("## 本选手有实质参与的交战窗口\n\n");
         sb.append("仅展示个人发生击杀/阵亡的窗口，以及全场伤害最高的 8 个本人参与窗口。")
-          .append("参与阈值为个人造成或承受至少 100 点英雄伤害，或发生击杀/阵亡；死亡交换不等同于团战收益。\n\n");
-        sb.append("| 开始 | 全场伤害 | 天辉阵亡 | 夜魇阵亡 | 个人输出/承伤 | 个人击杀/阵亡 |\n|---|---|---|---|---|---|\n");
+          .append("参与阈值为个人造成或承受至少 100 点英雄伤害，或发生击杀/阵亡；")
+          .append("死亡交换为阵亡数，经济列为窗口内各队英雄获得金币的净变化（买活支出为负），可辅助判断团战收益。\n\n");
+        sb.append("| 开始 | 全场伤害 | 天辉阵亡 | 夜魇阵亡 | 天辉/夜魇经济 | 个人输出/承伤 | 个人击杀/阵亡 |\n|---|---|---|---|---|---|---|\n");
         List<JsonNode> byDmg = new ArrayList<>(mine);
         byDmg.sort((a, b) -> Double.compare(b.path("hero_damage").asDouble(), a.path("hero_damage").asDouble()));
         Map<String, Boolean> hl = new LinkedHashMap<>();
@@ -474,6 +476,9 @@ public final class PlayerReviewGenerator {
               .append(ReportGenerator.gameTime(start))
               .append('|').append(f.path("hero_damage").asLong())
               .append('|').append(rad).append('|').append(dire).append('|');
+            JsonNode eco = f.path("economy");
+            sb.append(ReportGenerator.fmtK(eco.path("radiant").path("gold").asLong())).append('/')
+              .append(ReportGenerator.fmtK(eco.path("dire").path("gold").asLong())).append('|');
             JsonNode stats = f.path("player_stats").path(heroKey);
             sb.append(stats.path("damage_dealt").asLong()).append('/')
               .append(stats.path("damage_taken").asLong()).append('|')
@@ -541,6 +546,24 @@ public final class PlayerReviewGenerator {
             return;
         }
         sb.append("## 打钱/位置分析\n\n");
+        String lane = target.path("lane").asText("");
+        if (!lane.isEmpty()) {
+            sb.append("- 本英雄分路（开局 90 秒位置推断，置信度 ")
+              .append(target.path("lane_confidence").asInt()).append("%）：").append(lane).append('\n');
+        }
+        String heroKey = target.path("hero_key").asText("");
+        for (JsonNode f : metrics.path("farm_curves")) {
+            if (f.path("hero").asText().equals(heroKey) && f.path("points").isArray() && !f.path("points").isEmpty()) {
+                JsonNode last = f.path("points").get(f.path("points").size() - 1);
+                double endMin = Math.max(1.0, metrics.path("summary").path("duration_sec").asDouble() / 60.0);
+                sb.append("- 打钱数据（玩家资源计数，权威）：累计获得金币 ")
+                  .append(last.path("total_earned_gold").asLong())
+                  .append("，补刀 ").append(last.path("last_hits").asLong())
+                  .append("（").append(String.format("%.1f", last.path("last_hits").asLong() / endMin))
+                  .append("/分钟），反补 ").append(last.path("denies").asLong()).append('\n');
+                break;
+            }
+        }
         sb.append("坐标说明：正坐标 = 夜魇半场（右上），负坐标 = 天辉半场（左下）；")
            .append("对方半场按河道对角线（x+y=0）划分，深处 = x、y 均越过对方方向 2500 单位的区域；阵亡样本不计入。\n\n");
         sb.append("| 阶段 | 正式时间范围 | 样本数 | 对方半场占比 | 对方深处占比 |\n|---|---|---|---|---|\n");
@@ -561,12 +584,58 @@ public final class PlayerReviewGenerator {
         sb.append('\n');
     }
 
+    private void appendTeamObjectives(StringBuilder sb, JsonNode m, JsonNode target) {
+        int team = target.path("team").asInt();
+        JsonNode obj = m.path("objectives");
+        JsonNode rosh = obj.path("roshan_kills");
+        JsonNode bld = obj.path("building_kills");
+        List<JsonNode> roshMine = new ArrayList<>();
+        List<JsonNode> bldMine = new ArrayList<>();
+        if (rosh.isArray()) {
+            rosh.forEach(r -> {
+                if (r.path("team").asInt() == team) {
+                    roshMine.add(r);
+                }
+            });
+        }
+        if (bld.isArray()) {
+            bld.forEach(b -> {
+                if (b.path("destroyer_team").asInt() == team) {
+                    bldMine.add(b);
+                }
+            });
+        }
+        if (roshMine.isEmpty() && bldMine.isEmpty()) {
+            return;
+        }
+        sb.append("## 本方目标进度\n\n");
+        if (!roshMine.isEmpty()) {
+            sb.append("**本方肉山击杀**（肉山被本方击杀的时间与最后补刀）\n\n");
+            for (JsonNode r : roshMine) {
+                sb.append("- ").append(ReportGenerator.gameTime(r.path("t").asDouble()))
+                  .append(" 肉山（补刀 ").append(r.path("killer_key").asText("?")).append("）\n");
+            }
+            sb.append('\n');
+        }
+        if (!bldMine.isEmpty()) {
+            sb.append("**本方摧毁建筑**（遗迹即对方基地）\n\n");
+            sb.append("| 时间 | 建筑 |\n|---|---|\n");
+            for (JsonNode b : bldMine) {
+                sb.append('|').append(ReportGenerator.gameTime(b.path("t").asDouble()))
+                  .append('|').append(ReportGenerator.buildingLabel(
+                      b.path("building").asText(b.path("building_key").asText())))
+                  .append("|\n");
+            }
+            sb.append('\n');
+        }
+    }
+
     private void appendQuestions(StringBuilder sb) {
         sb.append("## 待回答问题（必答）\n\n");
         sb.append("1. **出装决策**：装备节奏是否合理？每件装备的时机与选择（对照装备时间线与经济对比），是否有明显拖延或错误选择？\n");
         sb.append("2. **团战切入**：结合个人输出/承伤和阵亡前事件链评价；只有事件证据充分时才能判断先手、收割、过度深入或技能使用问题；\n");
         sb.append("3. **打钱路线**：结合经济对比（是否停滞、何时被反超）与打钱/位置分析（各阶段在对方半场的比例），评价刷钱与地图控制；\n");
-        sb.append("4. **关键决策**：只评价数据能够证明的决策；没有建筑、肉山或视野证据时，不得声称某次击杀转化成了推进或控盾；\n");
+        sb.append("4. **关键决策**：只评价数据能够证明的决策；建筑与肉山时间线已在“本方目标进度”中给出，可据此判断击杀是否转化为推进或控盾，但无视野证据，不得声称眼位或反眼操作；\n");
         sb.append("5. **改进优先级**：给出一条按收益排序的可执行改进清单（每条必须引用上面数据）。\n");
     }
 
