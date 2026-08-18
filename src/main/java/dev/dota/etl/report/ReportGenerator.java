@@ -259,7 +259,8 @@ public final class ReportGenerator {
             return;
         }
         sb.append("## 击杀时间线（全部英雄击杀）\n\n");
-        sb.append("| 游戏时间 | 击杀者 | 被击杀 | 助攻 |\n|---|---|---|---|\n");
+        sb.append("| 游戏时间 | 击杀者 | 被击杀 | 助攻 | 阵亡者身价 | 对方2秒金币/经验 | 阵亡后对方目标 |\n")
+          .append("|---|---|---|---|---|---|---|\n");
         for (JsonNode k : kills) {
             sb.append('|').append(gameTime(k.path("t").asDouble()))
               .append('|').append(heroShort(k.path("killer").asText("")))
@@ -267,9 +268,25 @@ public final class ReportGenerator {
               .append('|');
             JsonNode assist = k.path("assist_players");
             sb.append(assist.isArray() && !assist.isEmpty() ? assist.size() + " 人" : "-")
-              .append("|\n");
+              .append('|');
+            JsonNode nw = k.path("victim_networth");
+            sb.append(nw.isNumber() ? fmtK(nw.asLong()) : "-").append('|');
+            JsonNode gold = k.path("killer_team_gold");
+            sb.append(gold.isNumber() ? gold.asLong() + "/" + k.path("killer_team_xp").asLong() : "-").append('|');
+            sb.append(deathFollowup(k.path("conceded_objective"), k.path("t").asDouble())).append("|\n");
         }
-        sb.append('\n');
+        sb.append("阵亡者身价为阵亡瞬间净资产；对方2秒金币/经验为击杀方全队在阵亡后 2 秒内获得的金币与经验")
+          .append("（含该窗口被动/补刀等其它收入，为击杀奖励的近似值）；阵亡后对方目标为阵亡后 20 秒内")
+          .append("击杀方拿下的首个建筑或肉山（无则 '-'）。\n\n");
+    }
+
+    static String deathFollowup(JsonNode co, double killT) {
+        if (co == null || co.isMissingNode() || co.isNull()) {
+            return "-";
+        }
+        String kind = co.path("kind").asText("");
+        String label = kind.equals("roshan") ? "肉山" : buildingLabel(co.path("target").asText(""));
+        return Math.round(co.path("t").asDouble() - killT) + "s后" + label;
     }
 
     private void appendTeamfights(StringBuilder sb, JsonNode m) {

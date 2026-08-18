@@ -173,9 +173,11 @@ official hero-kill counter (with final roster deaths as a fallback for older ext
   "roster": [ {"player": 0, "name": "xiao8", "hero": "LoneDruid", "hero_key": "lone_druid", "team": 2,
                "side": "radiant", "level": 25, "kills": 3, "deaths": 3, "assists": 9,
                "lane": "top", "lane_confidence": 94} ],
-  "kills": [ { "t": 884.9, "killer": "...", "killer_key": "marci", "victim": "...", "victim_key": "lone_druid",
-               "killer_team": 3, "victim_team": 2, "location": [-6111.0, -5903.0], "victim_networth": 870,
-               "assist_players": [9, 8, 5] } ],
+"kills": [ { "t": 884.9, "killer": "...", "killer_key": "marci", "victim": "...", "victim_key": "lone_druid",
+                "killer_team": 3, "victim_team": 2, "location": [-6111.0, -5903.0], "victim_networth": 870,
+                "assist_players": [9, 8, 5], "killer_team_gold": 284, "killer_team_xp": 120,
+                "conceded_objective": { "t": 892.4, "target": "npc_dota_badguys_tower1_top",
+                                        "target_key": "badguys_tower1_top", "kind": "building" } } ],
   "teamfights": [ { "id": 0, "start": 880.0, "end": 885.0, "duration": 5.0, "hero_damage": 750, "deaths": 1,
                     "participants": ["ember_spirit", "enchantress", "lone_druid", ...],
                     "economy": { "radiant": {"gold": 250, "xp": 180}, "dire": {"gold": 100, "xp": 60},
@@ -232,6 +234,13 @@ Notes:
   `denies`, bucketed every 60 s (bucket centre time, MAX per bucket keeps the monotonic counters
   after resets). Reports quote these as facts (e.g. final totals, last-hits-per-minute) instead of
   labelling the combat-log income curve as a "bank balance".
+- Each `kills` entry carries a death-cost assessment. `killer_team_gold` / `killer_team_xp` are
+  the gold / XP the killer team accrued in the 2 s after the kill (attributed via hero -> team);
+  they are **approximations** — the true kill bounty is not a reliable combat-log field, so the
+  window also includes passive income / last-hits / buyback spend (which can make the value
+  negative). `conceded_objective` (when present) is the first building or Roshan the killer team
+  took within 20 s of the death — an objective conceded off a kill is factual and is the clearest
+  death-cost signal. Knobs: `KILL_GOLD_WINDOW_SEC`, `KILL_FOLLOWUP_WINDOW_SEC` in `MetricsRunner`.
 - `damage` is per-hero hero-to-hero damage: `dealt_total` (attacker is a hero), `taken_total`
   (target is a hero, any source), and `per_minute` buckets of damage dealt. Drives the
   single-player review's engagement windows.

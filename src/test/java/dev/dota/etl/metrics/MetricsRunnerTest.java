@@ -1,5 +1,6 @@
 package dev.dota.etl.metrics;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Test;
@@ -64,7 +65,7 @@ class MetricsRunnerTest {
     @Test
     void computesSummary() throws Exception {
         ObjectNode m = runMetrics();
-        assertEquals(6, m.path("schema_version").asInt());
+        assertEquals(7, m.path("schema_version").asInt());
         assertEquals(5, m.path("parameters").path("teamfight_bucket_sec").asInt());
         com.fasterxml.jackson.databind.JsonNode s = m.path("summary");
         assertEquals(2, s.path("team_kills").size());
@@ -208,6 +209,37 @@ class MetricsRunnerTest {
         var axe = m.path("farm_curves").get(0);
         assertEquals("axe", axe.path("hero").asText());
         assertEquals(4, axe.path("points").get(1).path("last_hits").asInt());
+    }
+
+    @Test
+    void computesDeathCosts() throws Exception {
+        Path combat = dir.resolve("combatlog.ndjson");
+        Path players = dir.resolve("players.ndjson");
+        Files.write(combat, List.of(
+            // kill 1: pudge (team 2) kills axe; killer team gains gold/xp right after, then concedes a building
+            "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"attacker_team\":2,\"target_team\":3,\"value\":300,\"value_name\":\"none\",\"x\":1.0,\"y\":2.0,\"networth\":1200,\"assists\":[]}",
+            "{\"t\":100.5,\"type\":\"DOTA_COMBATLOG_GOLD\",\"target\":\"npc_dota_hero_pudge\",\"target_key\":\"pudge\",\"value\":250,\"gold_reason\":12}",
+            "{\"t\":100.8,\"type\":\"DOTA_COMBATLOG_XP\",\"target\":\"npc_dota_hero_pudge\",\"target_key\":\"pudge\",\"value\":100}",
+            "{\"t\":101.0,\"type\":\"DOTA_COMBATLOG_GOLD\",\"target\":\"npc_dota_hero_axe\",\"target_key\":\"axe\",\"value\":30,\"gold_reason\":12}",
+            "{\"t\":112.0,\"type\":\"DOTA_COMBATLOG_TEAM_BUILDING_KILL\",\"target\":\"npc_dota_badguys_tower1_top\",\"target_key\":\"badguys_tower1_top\",\"target_team\":3,\"attacker_team\":2}",
+            // kill 2: axe (team 3) kills pudge; killer team takes roshan within 20s
+            "{\"t\":120.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_axe\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_pudge\",\"target_hero\":true,\"attacker_team\":3,\"target_team\":2,\"value\":300,\"value_name\":\"none\",\"x\":1.0,\"y\":2.0,\"networth\":1300,\"assists\":[]}",
+            "{\"t\":121.5,\"type\":\"DOTA_COMBATLOG_GOLD\",\"target\":\"npc_dota_hero_axe\",\"target_key\":\"axe\",\"value\":300,\"gold_reason\":12}",
+            "{\"t\":125.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_roshan\",\"target_hero\":false,\"attacker_team\":3,\"target_team\":0,\"value\":165,\"x\":-1000.0,\"y\":-1000.0,\"networth\":1000,\"assists\":[]}"
+        ));
+        Files.write(players, List.of(
+            "{\"t\":0.0,\"tick\":0,\"player\":0,\"team\":2,\"name\":\"alice\",\"hero\":\"Pudge\",\"level\":5,\"kills\":0,\"deaths\":0,\"assists\":0,\"x\":100.0,\"y\":100.0,\"z\":64.0,\"hp\":1000.0,\"max_hp\":1000.0,\"total_earned_gold\":1200,\"last_hits\":15,\"denies\":2}",
+            "{\"t\":0.0,\"tick\":0,\"player\":1,\"team\":3,\"name\":\"bob\",\"hero\":\"Axe\",\"level\":4,\"kills\":0,\"deaths\":0,\"assists\":0,\"x\":-100.0,\"y\":-100.0,\"z\":64.0,\"hp\":900.0,\"max_hp\":900.0,\"total_earned_gold\":1100,\"last_hits\":12,\"denies\":1}"));
+        ObjectNode m = new MetricsRunner(combat, players).run();
+        assertEquals(2, m.path("kills").size());
+        JsonNode k0 = m.path("kills").get(0);
+        assertEquals(250, k0.path("killer_team_gold").asInt(), "gold only attributed to killer team in window");
+        assertEquals(100, k0.path("killer_team_xp").asInt());
+        assertEquals("building", k0.path("conceded_objective").path("kind").asText());
+        assertEquals("badguys_tower1_top", k0.path("conceded_objective").path("target_key").asText());
+        JsonNode k1 = m.path("kills").get(1);
+        assertEquals(300, k1.path("killer_team_gold").asInt());
+        assertEquals("roshan", k1.path("conceded_objective").path("kind").asText());
     }
 
     @Test

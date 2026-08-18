@@ -55,6 +55,10 @@ public final class MetricsRunner {
     private static final double FOUNTAIN_RADIUS = 5300;
     private static final int MIN_LANE_SAMPLES = 10;
 
+    // death-cost knobs (see addKills): gold/XP window and objective follow-up window after a kill
+    private static final double KILL_GOLD_WINDOW_SEC = 2.0;
+    private static final double KILL_FOLLOWUP_WINDOW_SEC = 20.0;
+
     /**
      * Columns the metrics layer relies on for correct results. A missing column would silently
      * turn into NULL (skipped filters / zero sums), so the NDJSON inputs are validated up front
@@ -126,6 +130,7 @@ public final class MetricsRunner {
 
                 addSummary(conn, metrics, match, timeOffset);
                 addRoster(conn, metrics);
+                createHeroTeam(conn);
                 addKills(conn, metrics);
                 addTeamfights(conn, metrics);
                 addObjectives(conn, metrics);
@@ -286,19 +291,21 @@ public final class MetricsRunner {
 
     private void addKills(Connection conn, ObjectNode root) throws Exception {
         ArrayNode arr = root.putArray("kills");
-        queryMaps(conn, """
+        for (Map<String, Object> row : queryMaps(conn, """
             SELECT t, raw_t, attacker, target, attacker_key, target_key, attacker_team, target_team, x, y, networth, assists
             FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero
             ORDER BY t
-            """).forEach(row -> {
+            """)) {
             ObjectNode k = arr.addObject();
-            k.put("t", round1(dbl(row.get("t"))));
+            double t = dbl(row.get("t"));
+            k.put("t", round1(t));
             k.put("raw_t", round1(dbl(row.get("raw_t"))));
             putStr(k, "killer", (String) row.get("attacker"));
             putStr(k, "killer_key", (String) row.get("attacker_key"));
             putStr(k, "victim", (String) row.get("target"));
             putStr(k, "victim_key", (String) row.get("target_key"));
-            k.put("killer_team", row.get("attacker_team") == null ? 0 : intOf(row.get("attacker_team")));
+            int killerTeam = row.get("attacker_team") == null ? 0 : intOf(row.get("attacker_team"));
+            k.put("killer_team", killerTeam);
             k.put("victim_team", intOf(row.get("target_team")));
             if (row.get("x") != null && row.get("y") != null) {
                 ArrayNode loc = k.putArray("location");
@@ -314,11 +321,60 @@ public final class MetricsRunner {
                     a.add(((Number) o).intValue());
                 }
             }
-        });
+            if (killerTeam == 2 || killerTeam == 3) {
+                queryMaps(conn, deathCostSql().formatted(killerTeam, t, t + KILL_GOLD_WINDOW_SEC)).forEach(cost -> {
+                    k.put("killer_team_gold", longOf(cost.get("gold")));
+                    k.put("killer_team_xp", longOf(cost.get("xp")));
+                });
+                queryMaps(conn, concededObjectiveSql().formatted(
+                        t, t + KILL_FOLLOWUP_WINDOW_SEC, killerTeam, t, t + KILL_FOLLOWUP_WINDOW_SEC, killerTeam))
+                    .stream().findFirst().ifPresent(obj -> {
+                        ObjectNode co = k.putObject("conceded_objective");
+                        co.put("t", round1(dbl(obj.get("t"))));
+                        putStr(co, "target", (String) obj.get("target"));
+                        putStr(co, "target_key", (String) obj.get("target_key"));
+                        putStr(co, "kind", (String) obj.get("kind"));
+                    });
+            }
+        }
     }
 
-    private void addTeamfights(Connection conn, ObjectNode root) throws Exception {
-        // shared with persistTables so the persisted tables mirror the JSON exactly
+    /**
+     * Gold/XP the killer team accrued in the short window after a kill, attributed through hero_team.
+     * Includes passive income, last-hits and anything else landing in that window, so it is an
+     * approximation of the kill's reward (the true kill bounty is not exposed as a reliable field).
+     */
+    private String deathCostSql() {
+        return """
+            SELECT COALESCE(SUM(CASE WHEN c.type='DOTA_COMBATLOG_GOLD' THEN c.value END), 0) AS gold,
+                   COALESCE(SUM(CASE WHEN c.type='DOTA_COMBATLOG_XP' THEN c.value END), 0) AS xp
+            FROM combatlog_v c
+            JOIN hero_team ht ON ht.hero_key = c.target_key
+            WHERE ht.team = %d AND c.t >= %f AND c.t <= %f
+              AND c.type IN ('DOTA_COMBATLOG_GOLD','DOTA_COMBATLOG_XP')
+            """;
+    }
+
+    /**
+     * First objective (building or roshan) the killer team took in the follow-up window after a kill,
+     * or empty when none. A death that concedes a tower / roshan is the clearest "death cost" signal.
+     */
+    private String concededObjectiveSql() {
+        return """
+            SELECT t, target, target_key, kind FROM (
+              SELECT t, target, target_key, 'building' AS kind
+              FROM combatlog_v
+              WHERE type='DOTA_COMBATLOG_TEAM_BUILDING_KILL' AND t >= %f AND t <= %f AND attacker_team = %d
+              UNION ALL
+              SELECT t, 'npc_dota_roshan' AS target, 'roshan' AS target_key, 'roshan' AS kind
+              FROM combatlog_v
+              WHERE type='DOTA_COMBATLOG_DEATH' AND target LIKE 'npc_dota_roshan%%' AND t >= %f AND t <= %f AND attacker_team = %d
+            ) ORDER BY t LIMIT 1
+            """;
+    }
+
+    /** Latest team per hero key (teams 2/3 only); shared by economy and death-cost attribution. */
+    private void createHeroTeam(Connection conn) throws Exception {
         conn.createStatement().execute("""
             CREATE TEMP TABLE hero_team AS
             SELECT hero_key, team FROM (
@@ -326,6 +382,10 @@ public final class MetricsRunner {
               FROM players_v WHERE hero_key IS NOT NULL AND team IN (2, 3)
             ) WHERE rn = 1
             """);
+    }
+
+    private void addTeamfights(Connection conn, ObjectNode root) throws Exception {
+        // shared with persistTables so the persisted tables mirror the JSON exactly
         conn.createStatement().execute("CREATE TEMP TABLE tf_episodes AS " + teamfightEpisodesSql());
         ArrayNode arr = root.putArray("teamfights");
         for (Object[] row : query(conn, "SELECT id, start, \"end\", hero_damage, deaths FROM tf_episodes ORDER BY start")) {

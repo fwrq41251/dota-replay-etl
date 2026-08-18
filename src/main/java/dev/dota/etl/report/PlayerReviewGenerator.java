@@ -161,9 +161,9 @@ public final class PlayerReviewGenerator {
             appendKillRow(sb, k, k.path("victim"));
         }
         sb.append("\n### 阵亡（").append(myDeaths.size()).append(" 次）\n\n");
-        sb.append("| 游戏时间 | 击杀者 | 位置 |\n|---|---|---|\n");
+        sb.append("| 游戏时间 | 击杀者 | 位置 | 阵亡者身价 | 对方2秒金币/经验 | 阵亡后对方目标 |\n|---|---|---|---|---|---|\n");
         for (JsonNode k : myDeaths) {
-            appendKillRow(sb, k, k.path("killer"));
+            appendDeathRow(sb, k, k.path("killer"));
         }
         sb.append('\n');
         if (!myKills.isEmpty()) {
@@ -188,6 +188,23 @@ public final class PlayerReviewGenerator {
             sb.append('-');
         }
         sb.append("|\n");
+    }
+
+    private static void appendDeathRow(StringBuilder sb, JsonNode k, JsonNode hero) {
+        sb.append('|').append(ReportGenerator.gameTime(k.path("t").asDouble()))
+          .append('|').append(ReportGenerator.heroShort(hero.asText(""))).append('|');
+        JsonNode loc = k.path("location");
+        if (loc.isArray() && loc.size() == 2) {
+            sb.append('(').append(ReportGenerator.fmt(loc.get(0).asDouble()))
+              .append(',').append(ReportGenerator.fmt(loc.get(1).asDouble())).append(')');
+        } else {
+            sb.append('-');
+        }
+        JsonNode nw = k.path("victim_networth");
+        sb.append('|').append(nw.isNumber() ? ReportGenerator.fmtK(nw.asLong()) : "-").append('|');
+        JsonNode gold = k.path("killer_team_gold");
+        sb.append(gold.isNumber() ? gold.asLong() + "/" + k.path("killer_team_xp").asLong() : "-").append('|');
+        sb.append(ReportGenerator.deathFollowup(k.path("conceded_objective"), k.path("t").asDouble())).append("|\n");
     }
 
     private void appendDeathWindows(StringBuilder sb, JsonNode metrics, String heroKey) throws Exception {
