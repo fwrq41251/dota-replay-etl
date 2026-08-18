@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CoreLogicTest {
@@ -38,6 +39,12 @@ class CoreLogicTest {
         assertEquals(6676393091L, ReplayExtractor.matchIdFromFilename("path/to/6676393091.dem.bz2"));
         assertEquals(0L, ReplayExtractor.matchIdFromFilename("replay.dem"));
         assertEquals(0L, ReplayExtractor.matchIdFromFilename("123.dem"));
+    }
+
+    @Test
+    void replayExtractorRejectsInvalidSample(@TempDir Path dir) {
+        assertThrows(IllegalArgumentException.class,
+            () -> ReplayExtractor.run(dir.resolve("missing.dem"), dir, 0));
     }
 
     @Test

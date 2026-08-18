@@ -9,7 +9,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ReplayDownloaderTest {
 
@@ -46,5 +48,17 @@ class ReplayDownloaderTest {
         Files.write(compressed, "<html>404 not found</html>".getBytes());
         assertThrows(Exception.class,
             () -> ReplayDownloader.decompress(compressed, dir.resolve("out.dem")));
+    }
+
+    @Test
+    void validatesReplayCacheHeader() throws Exception {
+        Path valid = dir.resolve("valid.dem");
+        Files.write(valid, "PBDEMS2\0payload".getBytes());
+        Path partial = dir.resolve("partial.dem");
+        Files.writeString(partial, "not a replay");
+
+        assertTrue(ReplayDownloader.isReplayFile(valid));
+        assertFalse(ReplayDownloader.isReplayFile(partial));
+        assertFalse(ReplayDownloader.isReplayFile(dir.resolve("missing.dem")));
     }
 }

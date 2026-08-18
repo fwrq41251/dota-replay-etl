@@ -2,12 +2,12 @@ package dev.dota.etl.download;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.dota.etl.util.AtomicFiles;
 import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream;
 import org.apache.commons.compress.compressors.zstandard.ZstdCompressorInputStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -63,9 +63,12 @@ public final class ReplayDownloader {
     public Path download(long matchId, Path destDir) throws IOException, InterruptedException {
         Files.createDirectories(destDir);
         Path demPath = destDir.resolve(matchId + ".dem");
-        if (Files.exists(demPath) && Files.size(demPath) > 0) {
+        if (isReplayFile(demPath)) {
             log.info("replay already cached at {}", demPath);
             return demPath;
+        }
+        if (Files.exists(demPath)) {
+            log.warn("ignoring invalid replay cache at {}; it will be replaced after a successful download", demPath);
         }
 
         ReplayInfo info = resolveReplayInfo(matchId);
@@ -74,19 +77,27 @@ public final class ReplayDownloader {
             : URI.create(String.format(CDN_TEMPLATE, info.cluster, matchId, info.replaySalt));
 
         log.info("downloading replay {} from {}", matchId, cdnUrl);
-        Path bz2 = destDir.resolve(matchId + ".dem.bz2");
-        HttpRequest req = HttpRequest.newBuilder(cdnUrl)
-            .timeout(Duration.ofMinutes(20))
-            .GET()
-            .build();
-        HttpResponse<Path> resp = http.send(req, HttpResponse.BodyHandlers.ofFile(bz2));
-        if (resp.statusCode() != 200) {
-            Files.deleteIfExists(bz2);
-            throw new IOException("replay CDN returned HTTP " + resp.statusCode() + " for " + cdnUrl
-                + " (replay may not be available for this match)");
+        Path compressedTemp = AtomicFiles.createTempSibling(destDir.resolve(matchId + ".dem.compressed"));
+        Path demTemp = AtomicFiles.createTempSibling(demPath);
+        try {
+            HttpRequest req = HttpRequest.newBuilder(cdnUrl)
+                .timeout(Duration.ofMinutes(20))
+                .GET()
+                .build();
+            HttpResponse<Path> resp = http.send(req, HttpResponse.BodyHandlers.ofFile(compressedTemp));
+            if (resp.statusCode() != 200) {
+                throw new IOException("replay CDN returned HTTP " + resp.statusCode() + " for " + cdnUrl
+                    + " (replay may not be available for this match)");
+            }
+            decompress(compressedTemp, demTemp);
+            if (!isReplayFile(demTemp)) {
+                throw new IOException("decompressed file does not have a supported Dota replay header");
+            }
+            AtomicFiles.replace(demTemp, demPath);
+        } finally {
+            Files.deleteIfExists(compressedTemp);
+            Files.deleteIfExists(demTemp);
         }
-        decompress(bz2, demPath);
-        Files.deleteIfExists(bz2);
         log.info("replay saved to {} ({} bytes)", demPath, Files.size(demPath));
         return demPath;
     }
@@ -191,6 +202,30 @@ public final class ReplayDownloader {
                 out.write(buf, 0, n);
             }
         }
+    }
+
+    static boolean isReplayFile(Path file) throws IOException {
+        if (!Files.isRegularFile(file) || Files.size(file) < 8) {
+            return false;
+        }
+        byte[] header;
+        try (InputStream in = Files.newInputStream(file)) {
+            header = in.readNBytes(8);
+        }
+        return startsWith(header, "PBDEMS2\0") || startsWith(header, "HL2DEMO\0");
+    }
+
+    private static boolean startsWith(byte[] bytes, String expected) {
+        byte[] prefix = expected.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        if (bytes.length < prefix.length) {
+            return false;
+        }
+        for (int i = 0; i < prefix.length; i++) {
+            if (bytes[i] != prefix[i]) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static String hex(byte[] b) {

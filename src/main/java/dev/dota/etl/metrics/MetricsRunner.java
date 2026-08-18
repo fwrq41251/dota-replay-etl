@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import dev.dota.etl.util.AtomicFiles;
+import dev.dota.etl.util.BuildInfo;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -12,6 +14,7 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.Statement;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -57,47 +60,64 @@ public final class MetricsRunner {
 
     public ObjectNode run() throws Exception {
         ObjectNode metrics = MAPPER.createObjectNode();
+        metrics.put("schema_version", BuildInfo.METRICS_SCHEMA_VERSION);
+        metrics.put("etl_version", BuildInfo.version());
+        metrics.put("generated_at", Instant.now().toString());
+        ObjectNode parameters = metrics.putObject("parameters");
+        parameters.put("teamfight_bucket_sec", BUCKET_SEC);
+        parameters.put("teamfight_death_weight", WEIGHT_DEATH);
+        parameters.put("teamfight_min_active_score", MIN_ACTIVE_SCORE);
         JsonNode match = readMatchJson();
+        if (match.hasNonNull("source_replay_sha256")) {
+            metrics.put("source_replay_sha256", match.path("source_replay_sha256").asText());
+        }
         double timeOffset = match.path("game_start_time_raw").asDouble(0);
-        try (Connection conn = DriverManager.getConnection("jdbc:duckdb:")) {
-            conn.createStatement().execute(
-                "CREATE VIEW combatlog AS SELECT * FROM read_ndjson('" + escape(combatLog) + "')");
-            conn.createStatement().execute(
-                "CREATE VIEW players AS SELECT * FROM read_ndjson('" + escape(players) + "')");
-            conn.createStatement().execute("""
-                CREATE TEMP TABLE hero_key_map AS
-                SELECT DISTINCT
-                  lower(replace(replace(name, 'npc_dota_hero_', ''), '_', '')) AS norm,
-                  replace(name, 'npc_dota_hero_', '') AS hero_key
-                FROM (
-                  SELECT attacker AS name FROM combatlog WHERE attacker LIKE 'npc_dota_hero_%'
-                  UNION
-                  SELECT target AS name FROM combatlog WHERE target LIKE 'npc_dota_hero_%'
-                )
-                """);
-            conn.createStatement().execute(("""
-                CREATE VIEW players_v AS SELECT * EXCLUDE(t), t AS raw_t, t - %f AS t,
-                  COALESCE((SELECT hero_key FROM hero_key_map
-                            WHERE norm = lower(replace(hero, '_', ''))),
-                           lower(regexp_replace(hero, '([a-z])([A-Z])', '\\1_\\2', 'g'))) AS hero_key
-                FROM players
-                """).formatted(timeOffset));
-            conn.createStatement().execute(("""
-                CREATE VIEW combatlog_v AS SELECT * EXCLUDE(t), t AS raw_t, t - %f AS t,
-                  replace(target, 'npc_dota_hero_', '') AS target_key,
-                  replace(attacker, 'npc_dota_hero_', '') AS attacker_key
-                FROM combatlog
-                """).formatted(timeOffset));
+        Path dbTemp = AtomicFiles.createTempSibling(dbFile());
+        Files.deleteIfExists(dbTemp);
+        try {
+            try (Connection conn = DriverManager.getConnection("jdbc:duckdb:")) {
+                conn.createStatement().execute(
+                    "CREATE VIEW combatlog AS SELECT * FROM read_ndjson('" + escape(combatLog) + "')");
+                conn.createStatement().execute(
+                    "CREATE VIEW players AS SELECT * FROM read_ndjson('" + escape(players) + "')");
+                conn.createStatement().execute("""
+                    CREATE TEMP TABLE hero_key_map AS
+                    SELECT DISTINCT
+                      lower(replace(replace(name, 'npc_dota_hero_', ''), '_', '')) AS norm,
+                      replace(name, 'npc_dota_hero_', '') AS hero_key
+                    FROM (
+                      SELECT attacker AS name FROM combatlog WHERE attacker LIKE 'npc_dota_hero_%'
+                      UNION
+                      SELECT target AS name FROM combatlog WHERE target LIKE 'npc_dota_hero_%'
+                    )
+                    """);
+                conn.createStatement().execute(("""
+                    CREATE VIEW players_v AS SELECT * EXCLUDE(t), t AS raw_t, t - %f AS t,
+                      COALESCE((SELECT hero_key FROM hero_key_map
+                                WHERE norm = lower(replace(hero, '_', ''))),
+                               lower(regexp_replace(hero, '([a-z])([A-Z])', '\\1_\\2', 'g'))) AS hero_key
+                    FROM players
+                    """).formatted(timeOffset));
+                conn.createStatement().execute(("""
+                    CREATE VIEW combatlog_v AS SELECT * EXCLUDE(t), t AS raw_t, t - %f AS t,
+                      replace(target, 'npc_dota_hero_', '') AS target_key,
+                      replace(attacker, 'npc_dota_hero_', '') AS attacker_key
+                    FROM combatlog
+                    """).formatted(timeOffset));
 
-            addSummary(conn, metrics, match, timeOffset);
-            addRoster(conn, metrics);
-            addKills(conn, metrics);
-            addTeamfights(conn, metrics);
-            addGoldCurves(conn, metrics);
-            addXpCurves(conn, metrics);
-            addItemTimeline(conn, metrics);
-            addDamage(conn, metrics);
-            persistTables(conn);
+                addSummary(conn, metrics, match, timeOffset);
+                addRoster(conn, metrics);
+                addKills(conn, metrics);
+                addTeamfights(conn, metrics);
+                addGoldCurves(conn, metrics);
+                addXpCurves(conn, metrics);
+                addItemTimeline(conn, metrics);
+                addDamage(conn, metrics);
+                persistTables(conn, dbTemp);
+            }
+            AtomicFiles.replace(dbTemp, dbFile());
+        } finally {
+            Files.deleteIfExists(dbTemp);
         }
         return metrics;
     }
@@ -240,11 +260,16 @@ public final class MetricsRunner {
               FROM act
             ),
             lagged AS (
-              SELECT b, score, active, LAG(active) OVER (ORDER BY b) AS prev_active FROM scored
+              SELECT b, score, active,
+                     LAG(b) OVER (ORDER BY b) AS prev_b,
+                     LAG(active) OVER (ORDER BY b) AS prev_active
+              FROM scored
             ),
             islands AS (
               SELECT b, score, active,
-                SUM(CASE WHEN active AND NOT COALESCE(prev_active, false) THEN 1 ELSE 0 END)
+                SUM(CASE WHEN active AND
+                    (NOT COALESCE(prev_active, false) OR b - prev_b > %d)
+                    THEN 1 ELSE 0 END)
                   OVER (ORDER BY b) AS grp
               FROM lagged
             )
@@ -252,7 +277,7 @@ public final class MetricsRunner {
                    SUM(CASE WHEN active THEN 1 ELSE 0 END) active_buckets
             FROM islands WHERE active
             GROUP BY grp ORDER BY start_b
-            """.formatted(BUCKET_SEC, BUCKET_SEC, score, score, MIN_ACTIVE_SCORE))
+            """.formatted(BUCKET_SEC, BUCKET_SEC, score, score, MIN_ACTIVE_SCORE, BUCKET_SEC))
             .forEach(row -> episodes.add(new double[]{
                 dbl(row[1]), dbl(row[2]) + BUCKET_SEC
             }));
@@ -362,10 +387,10 @@ public final class MetricsRunner {
     private void addItemTimeline(Connection conn, ObjectNode root) throws Exception {
         ArrayNode arr = root.putArray("item_timeline");
         List<Object[]> rows = query(conn, """
-            SELECT target_key AS hero, value_name item, MIN(t) t
+            SELECT target_key AS hero, value_name item, t
             FROM combatlog_v
             WHERE type='DOTA_COMBATLOG_PURCHASE' AND value_name IS NOT NULL AND target_key IS NOT NULL
-            GROUP BY target_key, value_name ORDER BY target_key, t
+            ORDER BY target_key, t
             """);
         String curHero = null;
         ArrayNode items = null;
@@ -431,9 +456,9 @@ public final class MetricsRunner {
         byHero.forEach((hero, node) -> node.put("dealt_total", totals.get(hero)[0]));
     }
 
-    private void persistTables(Connection conn) throws Exception {
+    private void persistTables(Connection conn, Path output) throws Exception {
         try (Statement st = conn.createStatement()) {
-            st.execute("ATTACH '" + escape(dbFile()) + "' AS out (TYPE duckdb)");
+            st.execute("ATTACH '" + escape(output) + "' AS out (TYPE duckdb)");
             st.execute("CREATE OR REPLACE TABLE out.combatlog AS SELECT * FROM combatlog_v");
             st.execute("CREATE OR REPLACE TABLE out.players AS SELECT * FROM players_v");
             st.execute("CREATE OR REPLACE TABLE out.kills AS SELECT * FROM combatlog_v " +
@@ -474,26 +499,22 @@ public final class MetricsRunner {
     }
 
     private List<Map<String, Object>> queryMaps(Connection conn, String sql) throws Exception {
-        List<Object[]> rows = query(conn, sql);
-        if (rows.isEmpty()) {
-            return List.of();
-        }
-        List<String> cols = new ArrayList<>();
         try (Statement st = conn.createStatement(); ResultSet rs = st.executeQuery(sql)) {
             ResultSetMetaData md = rs.getMetaData();
+            List<String> cols = new ArrayList<>();
             for (int i = 1; i <= md.getColumnCount(); i++) {
                 cols.add(md.getColumnLabel(i));
             }
-        }
-        List<Map<String, Object>> out = new ArrayList<>();
-        for (Object[] row : rows) {
-            Map<String, Object> map = new java.util.LinkedHashMap<>();
-            for (int i = 0; i < cols.size(); i++) {
-                map.put(cols.get(i), row[i]);
+            List<Map<String, Object>> out = new ArrayList<>();
+            while (rs.next()) {
+                Map<String, Object> map = new java.util.LinkedHashMap<>();
+                for (int i = 0; i < cols.size(); i++) {
+                    map.put(cols.get(i), unwrap(rs.getObject(i + 1)));
+                }
+                out.add(map);
             }
-            out.add(map);
+            return out;
         }
-        return out;
     }
 
     private List<Object[]> query(Connection conn, String sql) throws Exception {

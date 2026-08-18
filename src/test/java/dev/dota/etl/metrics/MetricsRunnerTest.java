@@ -32,6 +32,7 @@ class MetricsRunnerTest {
             "{\"t\":103.0,\"type\":\"DOTA_COMBATLOG_GOLD\",\"attacker\":\"dota_unknown\",\"target\":\"npc_dota_hero_pudge\",\"value\":250}",
             "{\"t\":103.5,\"type\":\"DOTA_COMBATLOG_XP\",\"attacker\":\"dota_unknown\",\"target\":\"npc_dota_hero_axe\",\"value\":180}",
             "{\"t\":105.0,\"type\":\"DOTA_COMBATLOG_PURCHASE\",\"target\":\"npc_dota_hero_pudge\",\"value_name\":\"item_blinkdagger\"}",
+            "{\"t\":106.0,\"type\":\"DOTA_COMBATLOG_PURCHASE\",\"target\":\"npc_dota_hero_pudge\",\"value_name\":\"item_blinkdagger\"}",
             // isolated activity later -> no episode merge across the gap
             "{\"t\":200.0,\"type\":\"DOTA_COMBATLOG_DAMAGE\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"value\":60,\"attacker_team\":2,\"target_team\":3}",
             "{\"t\":200.0,\"type\":\"DOTA_COMBATLOG_DAMAGE\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"value\":60,\"attacker_team\":2,\"target_team\":3}",
@@ -59,6 +60,8 @@ class MetricsRunnerTest {
     @Test
     void computesSummary() throws Exception {
         ObjectNode m = runMetrics();
+        assertEquals(2, m.path("schema_version").asInt());
+        assertEquals(5, m.path("parameters").path("teamfight_bucket_sec").asInt());
         com.fasterxml.jackson.databind.JsonNode s = m.path("summary");
         assertEquals(2, s.path("team_kills").size());
         assertEquals(2, s.path("team_kills").get(0).path("kills").asLong());   // final Axe deaths
@@ -92,7 +95,7 @@ class MetricsRunnerTest {
     @Test
     void computesTeamfights() throws Exception {
         ObjectNode m = runMetrics();
-        assertTrue(m.path("teamfights").size() >= 1);
+        assertEquals(2, m.path("teamfights").size(), "empty time buckets must split episodes");
         var tf = m.path("teamfights").get(0);
         assertEquals(100.0, tf.path("start").asDouble(), 1e-6);
         assertEquals(2, tf.path("deaths").asLong());
@@ -137,6 +140,8 @@ class MetricsRunnerTest {
         assertTrue(m.path("item_timeline").size() >= 1);
         assertEquals("item_blinkdagger",
             m.path("item_timeline").get(0).path("items").get(0).path("item").asText());
+        assertEquals(2, m.path("item_timeline").get(0).path("items").size(),
+            "repeated purchases must be retained");
     }
 
     @Test

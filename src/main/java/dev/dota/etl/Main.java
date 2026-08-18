@@ -2,22 +2,26 @@ package dev.dota.etl;
 
 import dev.dota.etl.download.ReplayDownloader;
 import dev.dota.etl.extract.ReplayExtractor;
+import dev.dota.etl.util.AtomicFiles;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * CLI entry point.
  *
  * <pre>
  *   dota-replay-etl analyze &lt;matchIdOrFile&gt; [--out DIR] [--cache DIR] [--sample SEC]
- *   dota-replay-etl download &lt;matchId&gt; [--out FILE]
+ *   dota-replay-etl download &lt;matchId&gt; [--out DIR]
  * </pre>
  *
  * When &lt;matchIdOrFile&gt; is all digits it is treated as a match id and downloaded
- * first (requires STEAM_API_KEY), otherwise it is treated as a path to a .dem file.
+ * first, otherwise it is treated as a path to a .dem file. STEAM_API_KEY is optional.
  */
 public final class Main {
 
@@ -37,32 +41,32 @@ public final class Main {
         }
     }
 
-    private int run(String[] args) throws Exception {
+    int run(String[] args) throws Exception {
         if (args.length == 0) {
             usage();
             return 2;
         }
-        String cmd = args[0];
-        switch (cmd) {
-            case "analyze":
-                return analyze(args);
-            case "metrics":
-                return metrics(args);
-            case "report":
-                return report(args);
-            case "player-review":
-                return playerReview(args);
-            case "download":
-                return download(args);
-            case "help":
-            case "-h":
-            case "--help":
-                usage();
-                return 0;
-            default:
-                log.error("unknown command '{}'", cmd);
-                usage();
-                return 2;
+        try {
+            String cmd = args[0];
+            return switch (cmd) {
+                case "analyze" -> analyze(args);
+                case "metrics" -> metrics(args);
+                case "report" -> report(args);
+                case "player-review" -> playerReview(args);
+                case "download" -> download(args);
+                case "help", "-h", "--help" -> {
+                    usage();
+                    yield 0;
+                }
+                default -> {
+                    log.error("unknown command '{}'", cmd);
+                    usage();
+                    yield 2;
+                }
+            };
+        } catch (IllegalArgumentException e) {
+            log.error("{}", e.getMessage());
+            return 2;
         }
     }
 
@@ -72,18 +76,19 @@ public final class Main {
             return 2;
         }
         String input = args[1];
-        Path out = arg(args, "--out").map(Path::of).orElse(Path.of("out"));
-        Path cache = arg(args, "--cache").map(Path::of).orElse(Path.of("replays"));
-        int sample = arg(args, "--sample").map(Integer::parseInt).orElse(1);
+        Map<String, String> options = options(args, 2, "--out", "--cache", "--sample");
+        Path out = value(options, "--out").map(Path::of).orElse(Path.of("out"));
+        Path cache = value(options, "--cache").map(Path::of).orElse(Path.of("replays"));
+        int sample = value(options, "--sample").map(Main::positiveInt).orElse(1);
 
         Path dem;
         if (isDigits(input)) {
-            long matchId = Long.parseLong(input);
+            long matchId = positiveLong(input, "match id");
             dem = new ReplayDownloader().download(matchId, cache);
         } else {
             dem = Path.of(input);
-            if (!Files.exists(dem)) {
-                log.error("file not found: {}", dem.toAbsolutePath());
+            if (!Files.isRegularFile(dem)) {
+                log.error("replay file not found: {}", dem.toAbsolutePath());
                 return 1;
             }
         }
@@ -100,7 +105,7 @@ public final class Main {
     }
 
     private int metrics(String[] args) throws Exception {
-        if (args.length < 2) {
+        if (args.length != 2) {
             log.error("metrics requires an output directory containing the ETL result (e.g. out/6676393091)");
             return 2;
         }
@@ -120,7 +125,7 @@ public final class Main {
         dev.dota.etl.metrics.MetricsRunner runner = new dev.dota.etl.metrics.MetricsRunner(combat, players);
         long t0 = System.currentTimeMillis();
         com.fasterxml.jackson.databind.node.ObjectNode metrics = runner.run();
-        Files.writeString(runner.metricsJson(),
+        AtomicFiles.writeString(runner.metricsJson(),
             MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(metrics) + "\n");
         log.info("match {} metrics written to {} in {}ms",
             matchId, runner.metricsJson().toAbsolutePath(), System.currentTimeMillis() - t0);
@@ -129,7 +134,7 @@ public final class Main {
     }
 
     private int report(String[] args) throws Exception {
-        if (args.length < 2) {
+        if (args.length != 2) {
             log.error("report requires an output directory containing metrics.json (e.g. out/6676393091)");
             return 2;
         }
@@ -151,15 +156,16 @@ public final class Main {
             log.error("download requires a match id");
             return 2;
         }
-        long matchId = Long.parseLong(args[1]);
-        Path out = arg(args, "--out").map(Path::of).orElse(Path.of("replays"));
+        long matchId = positiveLong(args[1], "match id");
+        Map<String, String> options = options(args, 2, "--out");
+        Path out = value(options, "--out").map(Path::of).orElse(Path.of("replays"));
         Path dem = new ReplayDownloader().download(matchId, out);
         log.info("downloaded {}", dem.toAbsolutePath());
         return 0;
     }
 
     private int playerReview(String[] args) throws Exception {
-        if (args.length < 3) {
+        if (args.length != 3) {
             log.error("player-review requires an output directory and a player selector " +
                 "(hero/name/player index, e.g. out/8943544578 slark)");
             return 2;
@@ -178,17 +184,50 @@ public final class Main {
         return 0;
     }
 
-    private static java.util.Optional<String> arg(String[] args, String name) {
-        for (int i = 0; i < args.length - 1; i++) {
-            if (args[i].equals(name)) {
-                return java.util.Optional.of(args[i + 1]);
+    private static Map<String, String> options(String[] args, int start, String... allowedNames) {
+        Set<String> allowed = Set.of(allowedNames);
+        Map<String, String> values = new HashMap<>();
+        for (int i = start; i < args.length; i += 2) {
+            String name = args[i];
+            if (!allowed.contains(name)) {
+                throw new IllegalArgumentException("unknown option or unexpected argument '" + name + "'");
+            }
+            if (i + 1 >= args.length || args[i + 1].startsWith("--")) {
+                throw new IllegalArgumentException("option " + name + " requires a value");
+            }
+            if (values.putIfAbsent(name, args[i + 1]) != null) {
+                throw new IllegalArgumentException("option " + name + " was specified more than once");
             }
         }
-        return java.util.Optional.empty();
+        return values;
+    }
+
+    private static java.util.Optional<String> value(Map<String, String> options, String name) {
+        return java.util.Optional.ofNullable(options.get(name));
+    }
+
+    private static int positiveInt(String value) {
+        long parsed = positiveLong(value, "sample interval");
+        if (parsed > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("sample interval is too large: " + value);
+        }
+        return (int) parsed;
+    }
+
+    private static long positiveLong(String value, String label) {
+        try {
+            long parsed = Long.parseLong(value);
+            if (parsed <= 0) {
+                throw new IllegalArgumentException(label + " must be greater than zero");
+            }
+            return parsed;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("invalid " + label + ": '" + value + "'");
+        }
     }
 
     private static boolean isDigits(String s) {
-        return s.chars().allMatch(Character::isDigit);
+        return !s.isEmpty() && s.chars().allMatch(Character::isDigit);
     }
 
     private static void usage() {
@@ -197,8 +236,8 @@ public final class Main {
 
             Usage:
               dota-replay-etl analyze <matchIdOrFile> [--out DIR] [--cache DIR] [--sample SEC]
-                  Parse a replay. <matchIdOrFile> is a match id (downloaded first, requires
-                  STEAM_API_KEY) or a path to a .dem file.
+                  Parse a replay. <matchIdOrFile> is a match id (downloaded first) or a path
+                  to a .dem file. STEAM_API_KEY is optional.
                   --out     output directory (default: ./out)
                   --cache   replay cache directory (default: ./replays)
                   --sample  player state sampling interval in seconds (default: 1)
@@ -215,8 +254,8 @@ public final class Main {
                   Assemble a single-player Chinese review prompt (出装/团战/打钱/决策)
                   for one hero into player-review-<hero>.md (dry-run, no API call).
 
-              dota-replay-etl download <matchId> [--out FILE]
-                  Download and decompress a replay by match id (requires STEAM_API_KEY).
+              dota-replay-etl download <matchId> [--out DIR]
+                  Download and decompress a replay by match id (STEAM_API_KEY is optional).
 
             Output layout (per match):
               <out>/<matchId>/combatlog.ndjson   every combat log entry, one JSON object per line
@@ -229,6 +268,6 @@ public final class Main {
             """);
     }
 
-    private Main() {
+    Main() {
     }
 }

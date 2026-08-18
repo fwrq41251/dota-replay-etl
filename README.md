@@ -5,7 +5,7 @@ Parses a replay into plain NDJSON streams that feed a downstream analytics / LLM
 
 ## Build
 
-Requires JDK 21 and Maven.
+Requires JDK 17 or newer and Maven.
 
 ```
 mvn -DskipTests package
@@ -20,10 +20,12 @@ dota-replay-etl analyze <matchIdOrFile> [--out DIR] [--cache DIR] [--sample SEC]
 dota-replay-etl metrics <outputDir>
 dota-replay-etl report <outputDir>
 dota-replay-etl player-review <outputDir> <heroOrNameOrIndex>
-dota-replay-etl download <matchId> [--out FILE]
+dota-replay-etl download <matchId> [--out DIR]
 ```
 
 `<matchIdOrFile>` is either a numeric match id (downloaded first) or a path to a `.dem` file.
+When a local filename does not contain a match id, output is written under
+`<out>/local-<replay-hash>/` instead of a shared `out/0` directory.
 
 ```
 # from a local replay
@@ -57,6 +59,9 @@ magic bytes: classic replays are BZip2, newer ones are Zstandard (both supported
 `STEAM_API_KEY` is set, resolution goes through the official `GetReplayInfo` endpoint instead.
 
 Downloaded replays are cached under `--cache` (default `replays/`) and reused if present.
+Downloads and extraction outputs are written through temporary files, so a failed run does not
+replace a previously valid replay or ETL result. Re-running extraction invalidates derived metrics
+and prompts for that match.
 
 ## Output layout
 
@@ -76,6 +81,9 @@ Downloaded replays are cached under `--cache` (default `replays/`) and reused if
 ```json
 {
   "match_id": 6676393091,
+  "schema_version": 2,
+  "etl_version": "0.1.0-SNAPSHOT",
+  "source_replay_sha256": "...",
   "map_name": "start",
   "demo_file_stamp": "TI10 ...",
   "network_protocol": 8,
@@ -170,6 +178,7 @@ Notes:
   combat-log-derived sections join with `roster.hero_key`.
 - `gold_curves` / `xp_curves` are cumulative sums of combat-log GOLD / XP events per hero,
   bucketed every 30 / 60 s (bucket centre time). Gold starts at 600 (starting gold).
+- `item_timeline` retains every purchase event, including repeated purchases of the same item.
 - `teamfights` are runs of 5-second activity buckets where
   `damage_events + 4*deaths >= 8`, where `damage_events` counts **hero-to-hero** damage
   (attacker and target are both heroes) and `deaths` are hero deaths. `hero_damage` in each

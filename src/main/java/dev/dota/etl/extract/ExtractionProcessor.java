@@ -176,34 +176,34 @@ public class ExtractionProcessor {
         rec.put("target_hero", cle.isTargetHero());
         rec.put("target_self", cle.isTargetSelf());
         put(rec, "inflictor", str(cle.getInflictorName()));
-        put(rec, "value", num(cle.getValue()));
+        put(rec, "value", cle.hasValue() ? cle.getValue() : null);
         put(rec, "value_name", str(cle.getValueName()));
-        put(rec, "health", num(cle.getHealth()));
-        put(rec, "x", num(cle.getLocationX()));
-        put(rec, "y", num(cle.getLocationY()));
-        put(rec, "attacker_team", num(cle.getAttackerTeam()));
-        put(rec, "target_team", num(cle.getTargetTeam()));
+        put(rec, "health", cle.hasHealth() ? cle.getHealth() : null);
+        put(rec, "x", cle.hasLocationX() ? cle.getLocationX() : null);
+        put(rec, "y", cle.hasLocationY() ? cle.getLocationY() : null);
+        put(rec, "attacker_team", cle.hasAttackerTeam() ? cle.getAttackerTeam() : null);
+        put(rec, "target_team", cle.hasTargetTeam() ? cle.getTargetTeam() : null);
         put(rec, "visible_radiant", cle.isVisibleRadiant());
         put(rec, "visible_dire", cle.isVisibleDire());
-        put(rec, "gold_reason", num(cle.getGoldReason()));
-        put(rec, "xp_reason", num(cle.getXpReason()));
-        put(rec, "ability_level", num(cle.getAbilityLevel()));
-        put(rec, "rune_type", num(cle.getRuneType()));
-        put(rec, "stack_count", num(cle.getStackCount()));
-        put(rec, "last_hits", num(cle.getLastHits()));
-        put(rec, "networth", num(cle.getNetworth()));
-        put(rec, "obs_wards", num(cle.getObsWardsPlaced()));
-        put(rec, "neutral_camp_type", num(cle.getNeutralCampType()));
-        put(rec, "modifier_duration", num(cle.getModifierDuration()));
-        put(rec, "stun_duration", num(cle.getStunDuration()));
-        put(rec, "slow_duration", num(cle.getSlowDuration()));
-        put(rec, "damage_type", num(cle.getDamageType()));
-        put(rec, "damage_category", num(cle.getDamageCategory()));
-        put(rec, "event_location", num(cle.getEventLocation()));
-        put(rec, "xpm", num(cle.getXpm()));
-        put(rec, "gpm", num(cle.getGpm()));
-        put(rec, "attacker_hero_level", num(cle.getAttackerHeroLevel()));
-        put(rec, "target_hero_level", num(cle.getTargetHeroLevel()));
+        put(rec, "gold_reason", cle.hasGoldReason() ? cle.getGoldReason() : null);
+        put(rec, "xp_reason", cle.hasXpReason() ? cle.getXpReason() : null);
+        put(rec, "ability_level", cle.hasAbilityLevel() ? cle.getAbilityLevel() : null);
+        put(rec, "rune_type", cle.hasRuneType() ? cle.getRuneType() : null);
+        put(rec, "stack_count", cle.hasStackCount() ? cle.getStackCount() : null);
+        put(rec, "last_hits", cle.hasLastHits() ? cle.getLastHits() : null);
+        put(rec, "networth", cle.hasNetworth() ? cle.getNetworth() : null);
+        put(rec, "obs_wards", cle.hasObsWardsPlaced() ? cle.getObsWardsPlaced() : null);
+        put(rec, "neutral_camp_type", cle.hasNeutralCampType() ? cle.getNeutralCampType() : null);
+        put(rec, "modifier_duration", cle.hasModifierDuration() ? cle.getModifierDuration() : null);
+        put(rec, "stun_duration", cle.hasStunDuration() ? cle.getStunDuration() : null);
+        put(rec, "slow_duration", cle.hasSlowDuration() ? cle.getSlowDuration() : null);
+        put(rec, "damage_type", cle.hasDamageType() ? cle.getDamageType() : null);
+        put(rec, "damage_category", cle.hasDamageCategory() ? cle.getDamageCategory() : null);
+        put(rec, "event_location", cle.hasEventLocation() ? cle.getEventLocation() : null);
+        put(rec, "xpm", cle.hasXpm() ? cle.getXpm() : null);
+        put(rec, "gpm", cle.hasGpm() ? cle.getGpm() : null);
+        put(rec, "attacker_hero_level", cle.hasAttackerHeroLevel() ? cle.getAttackerHeroLevel() : null);
+        put(rec, "target_hero_level", cle.hasTargetHeroLevel() ? cle.getTargetHeroLevel() : null);
         put(rec, "target_source", str(cle.getTargetSourceName()));
         put(rec, "damage_source", str(cle.getDamageSourceName()));
         if (cle.hasAssistPlayers()) {
@@ -277,9 +277,9 @@ public class ExtractionProcessor {
             int pos = team == null ? -1 : teamPos(p, team);
             DataLookup data = team != null && team == 2 ? radiantData : (team != null && team == 3 ? direData : null);
             if (data != null && pos >= 0) {
-                put(rec, "total_earned_gold", intOrNull(null, data.totalEarnedGold[pos]));
-                put(rec, "last_hits", intOrNull(null, data.lastHits[pos]));
-                put(rec, "denies", intOrNull(null, data.denies[pos]));
+                put(rec, "total_earned_gold", intOrNull(data.entity, data.totalEarnedGold[pos]));
+                put(rec, "last_hits", intOrNull(data.entity, data.lastHits[pos]));
+                put(rec, "denies", intOrNull(data.entity, data.denies[pos]));
             }
 
             Entity hero = lookup.heroEntity;
@@ -315,6 +315,8 @@ public class ExtractionProcessor {
         }
         if (radiantData == null) {
             radiantData = DataLookup.tryCreate(entities.getByDtName((s2 ? "CDOTA_" : "DT_DOTA_") + "DataRadiant"));
+        }
+        if (direData == null) {
             direData = DataLookup.tryCreate(entities.getByDtName((s2 ? "CDOTA_" : "DT_DOTA_") + "DataDire"));
         }
     }
@@ -391,14 +393,6 @@ public class ExtractionProcessor {
         } else {
             node.put(field, value.toString());
         }
-    }
-
-    private static Object num(int v) {
-        return v == 0 ? null : v;
-    }
-
-    private static Object num(float v) {
-        return v == 0 ? null : v;
     }
 
     private static String str(String s) {
@@ -626,15 +620,20 @@ public class ExtractionProcessor {
     }
 
     private static final class DataLookup {
+        final Entity entity;
         final FieldPath[] totalEarnedGold = new FieldPath[5];
         final FieldPath[] lastHits = new FieldPath[5];
         final FieldPath[] denies = new FieldPath[5];
 
+        private DataLookup(Entity entity) {
+            this.entity = entity;
+        }
+
         static DataLookup tryCreate(Entity dataEntity) {
-            DataLookup lk = new DataLookup();
             if (dataEntity == null) {
-                return lk;
+                return null;
             }
+            DataLookup lk = new DataLookup(dataEntity);
             for (int pos = 0; pos < 5; pos++) {
                 String a = Util.arrayIdxToString(pos);
                 lk.totalEarnedGold[pos] = fp(dataEntity.getDtClass(), "m_vecDataTeam." + a + ".m_iTotalEarnedGold");
