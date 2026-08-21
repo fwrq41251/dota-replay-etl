@@ -37,6 +37,9 @@ class MetricsRunnerTest {
             "{\"t\":104.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_axe\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_pudge\",\"target_hero\":true,\"value\":300,\"attacker_team\":3,\"target_team\":2,\"networth\":1300,\"assists\":[1]}",
             "{\"t\":103.0,\"type\":\"DOTA_COMBATLOG_GOLD\",\"attacker\":\"dota_unknown\",\"target\":\"npc_dota_hero_pudge\",\"value\":250}",
             "{\"t\":103.5,\"type\":\"DOTA_COMBATLOG_XP\",\"attacker\":\"dota_unknown\",\"target\":\"npc_dota_hero_axe\",\"value\":180}",
+            // exactly at the first episode end ([100,105)): must not leak into that fight
+            "{\"t\":105.0,\"type\":\"DOTA_COMBATLOG_XP\",\"attacker\":\"dota_unknown\",\"target\":\"npc_dota_hero_pudge\",\"value\":999}",
+            "{\"t\":105.0,\"type\":\"DOTA_COMBATLOG_DAMAGE\",\"attacker\":\"npc_dota_hero_lion\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_pudge\",\"target_hero\":true,\"value\":1,\"attacker_team\":3,\"target_team\":2}",
             "{\"t\":105.0,\"type\":\"DOTA_COMBATLOG_PURCHASE\",\"target\":\"npc_dota_hero_pudge\",\"value_name\":\"item_blinkdagger\"}",
             "{\"t\":106.0,\"type\":\"DOTA_COMBATLOG_PURCHASE\",\"target\":\"npc_dota_hero_pudge\",\"value_name\":\"item_blinkdagger\"}",
             // isolated activity later -> no episode merge across the gap
@@ -66,7 +69,7 @@ class MetricsRunnerTest {
     @Test
     void computesSummary() throws Exception {
         ObjectNode m = runMetrics();
-        assertEquals(8, m.path("schema_version").asInt());
+        assertEquals(9, m.path("schema_version").asInt());
         assertEquals(5, m.path("parameters").path("teamfight_bucket_sec").asInt());
         com.fasterxml.jackson.databind.JsonNode s = m.path("summary");
         assertEquals(2, s.path("team_kills").size());
@@ -247,11 +250,13 @@ class MetricsRunnerTest {
         ObjectNode m = new MetricsRunner(combat, players).run();
         assertEquals(2, m.path("kills").size());
         JsonNode k0 = m.path("kills").get(0);
+        assertEquals(0, k0.path("kill_id").asInt());
         assertEquals(250, k0.path("killer_team_gold").asInt(), "gold only attributed to killer team in window");
         assertEquals(100, k0.path("killer_team_xp").asInt());
         assertEquals("building", k0.path("conceded_objective").path("kind").asText());
         assertEquals("badguys_tower1_top", k0.path("conceded_objective").path("target_key").asText());
         JsonNode k1 = m.path("kills").get(1);
+        assertEquals(1, k1.path("kill_id").asInt());
         assertEquals(300, k1.path("killer_team_gold").asInt());
         assertEquals("roshan", k1.path("conceded_objective").path("kind").asText());
     }
@@ -295,6 +300,26 @@ class MetricsRunnerTest {
             m.path("item_timeline").get(0).path("items").get(0).path("item").asText());
         assertEquals(2, m.path("item_timeline").get(0).path("items").size(),
             "repeated purchases must be retained");
+    }
+
+    @Test
+    void goldCurveUsesLastCumulativeValueInBucket() throws Exception {
+        Path combat = dir.resolve("combatlog.ndjson");
+        Path players = dir.resolve("players.ndjson");
+        Files.write(combat, List.of(
+            "{\"t\":10.0,\"type\":\"DOTA_COMBATLOG_GOLD\",\"target\":\"npc_dota_hero_pudge\",\"value\":300,\"attacker_hero\":false,\"target_hero\":true,\"attacker_team\":0,\"target_team\":2}",
+            "{\"t\":20.0,\"type\":\"DOTA_COMBATLOG_GOLD\",\"target\":\"npc_dota_hero_pudge\",\"value\":-100,\"attacker_hero\":false,\"target_hero\":true,\"attacker_team\":0,\"target_team\":2}",
+            "{\"t\":20.0,\"type\":\"DOTA_COMBATLOG_GOLD\",\"target\":\"npc_dota_hero_pudge\",\"value\":50,\"attacker_hero\":false,\"target_hero\":true,\"attacker_team\":0,\"target_team\":2}",
+            "{\"t\":20.0,\"type\":\"DOTA_COMBATLOG_GOLD\",\"target\":\"npc_dota_hero_pudge\",\"value\":-25,\"attacker_hero\":false,\"target_hero\":true,\"attacker_team\":0,\"target_team\":2}",
+            "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_axe\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_pudge\",\"target_hero\":true,\"attacker_team\":3,\"target_team\":2,\"value\":300,\"value_name\":null,\"x\":1.0,\"y\":2.0,\"networth\":800,\"assists\":[]}"
+        ));
+        Files.write(players, List.of(
+            "{\"t\":0.0,\"tick\":0,\"player\":0,\"team\":2,\"name\":\"alice\",\"hero\":\"Pudge\",\"level\":1,\"kills\":0,\"deaths\":1,\"assists\":0,\"x\":100.0,\"y\":100.0,\"hp\":100.0,\"total_earned_gold\":800,\"last_hits\":0,\"denies\":0}"
+        ));
+
+        ObjectNode m = new MetricsRunner(combat, players).run();
+        assertEquals(225, m.path("gold_curves").get(0).path("points").get(0).path("gold").asLong(),
+            "bucket value must be the cumulative value at the last event, not the peak");
     }
 
     @Test
@@ -416,6 +441,14 @@ class MetricsRunnerTest {
                 }
             }
             assertEquals(m.path("kills").size(), costRows, "death_costs should cover every kill");
+            long joinedCosts = 0;
+            try (var rs = conn.createStatement().executeQuery(
+                    "SELECT COUNT(*) FROM kills k JOIN death_costs d USING (kill_id)")) {
+                if (rs.next()) {
+                    joinedCosts = rs.getLong(1);
+                }
+            }
+            assertEquals(costRows, joinedCosts, "kill_id should join kills to death_costs without loss");
         }
     }
 

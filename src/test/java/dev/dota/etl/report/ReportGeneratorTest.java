@@ -61,6 +61,10 @@ class ReportGeneratorTest {
          .put("killer_team", 2).put("victim_team", 3).put("victim_networth", 800);
         ArrayNode assist = k.putArray("assist_players");
         assist.add(0);
+        // Exactly at the fight end: belongs to the next half-open interval, not [115,125).
+        kills.addObject().put("t", 125.0).put("killer", "npc_dota_hero_axe")
+             .put("victim", "npc_dota_hero_pudge").put("killer_key", "axe")
+             .put("victim_key", "pudge").put("killer_team", 3).put("victim_team", 2);
 
         ArrayNode tfs = metrics.putArray("teamfights");
         ObjectNode tf = tfs.addObject();
@@ -93,6 +97,8 @@ class ReportGeneratorTest {
         assertTrue(prompt.contains("|alice|Pudge|-|6/1/5|12|"), "roster row");
         assertTrue(prompt.contains("经济差（天辉 - 夜魇"), "economy label");
         assertTrue(prompt.contains("pudge"), "kill row");
+        assertTrue(prompt.contains("|★1:55|0:10|210|0|1|"),
+            "death exactly at fight end must not be counted in the previous window");
         assertTrue(prompt.contains("blinkdagger"), "key item");
         assertTrue(prompt.contains("本场 MVP"), "MVP question");
         assertTrue(prompt.contains("角色完成度最低的选手（可不选）"), "evidence-aware low performer question");

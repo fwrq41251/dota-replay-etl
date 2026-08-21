@@ -472,7 +472,7 @@ public final class PlayerReviewGenerator {
             long myKillCount = 0;
             long myDeathCount = 0;
             for (double[] k : kills) {
-                if (k[0] >= start && k[0] <= end) {
+                if (k[0] >= start && k[0] < end) {
                     if (k[1] == 2) {
                         rad++;
                     } else {
@@ -481,12 +481,12 @@ public final class PlayerReviewGenerator {
                 }
             }
             for (double[] k : myKills) {
-                if (k[0] >= start && k[0] <= end) {
+                if (k[0] >= start && k[0] < end) {
                     myKillCount++;
                 }
             }
             for (double[] k : myDeaths) {
-                if (k[0] >= start && k[0] <= end) {
+                if (k[0] >= start && k[0] < end) {
                     myDeathCount++;
                 }
             }
@@ -659,7 +659,7 @@ public final class PlayerReviewGenerator {
 
     private static boolean hasEventInWindow(List<double[]> events, double start, double end) {
         for (double[] event : events) {
-            if (event[0] >= start && event[0] <= end) {
+            if (event[0] >= start && event[0] < end) {
                 return true;
             }
         }

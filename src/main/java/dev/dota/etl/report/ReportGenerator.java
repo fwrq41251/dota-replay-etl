@@ -325,7 +325,7 @@ public final class ReportGenerator {
             int radDeaths = 0;
             int direDeaths = 0;
             for (double[] k : kills) {
-                if (k[0] >= start && k[0] <= end) {
+                if (k[0] >= start && k[0] < end) {
                     if (k[1] == 2) {
                         radDeaths++;
                     } else {

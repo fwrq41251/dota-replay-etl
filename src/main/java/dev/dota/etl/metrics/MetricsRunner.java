@@ -24,6 +24,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
+import static dev.dota.etl.metrics.MetricQueries.*;
+
 /**
  * Computes match metrics from the ETL output (combatlog.ndjson + players.ndjson)
  * using an in-memory DuckDB. Emits:
@@ -45,43 +47,6 @@ import java.util.Set;
 public final class MetricsRunner {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-
-    /**
-     * SQL templating: replaces {@code {}} placeholders in order with {@code String.valueOf(args)}.
-     * Using a single placeholder style (instead of {@code %f}/{@code %d} String.format) keeps the
-     * output locale-independent (a comma-decimal locale would otherwise emit {@code 288,1} and break
-     * DuckDB parsing) and removes the {@code %%} escaping needed for LIKE wildcards in formatted().
-     * Only internal constants and generated SQL are interpolated; replay data is never inserted.
-     * The NDJSON file paths are escaped separately.
-     */
-    private static String sql(String template, Object... args) {
-        String out = template;
-        for (Object arg : args) {
-            int placeholder = out.indexOf("{}");
-            if (placeholder < 0) {
-                throw new IllegalArgumentException("too many SQL template arguments");
-            }
-            out = out.substring(0, placeholder) + arg + out.substring(placeholder + 2);
-        }
-        if (out.contains("{}")) {
-            throw new IllegalArgumentException("missing SQL template argument");
-        }
-        return out;
-    }
-
-    // teamfight detection knobs
-    private static final int BUCKET_SEC = 5;
-    private static final double WEIGHT_DEATH = 4.0;
-    private static final double MIN_ACTIVE_SCORE = 8.0;
-
-    // lane inference knobs (early-game position clustering, see computeLanes)
-    private static final int LANE_WINDOW_SEC = 90;
-    private static final double FOUNTAIN_RADIUS = 5300;
-    private static final int MIN_LANE_SAMPLES = 10;
-
-    // death-cost knobs (see addKills): gold/XP window and objective follow-up window after a kill
-    private static final double KILL_GOLD_WINDOW_SEC = 2.0;
-    private static final double KILL_FOLLOWUP_WINDOW_SEC = 20.0;
 
     /**
      * Columns the metrics layer relies on for correct results. A missing column would silently
@@ -156,6 +121,7 @@ public final class MetricsRunner {
 
                 validateInputSchema(conn);
 
+                createHeroKills(conn);
                 addSummary(conn, metrics, match, timeOffset);
                 addRoster(conn, metrics);
                 createHeroTeam(conn);
@@ -167,7 +133,7 @@ public final class MetricsRunner {
                 addXpCurves(conn, metrics);
                 addItemTimeline(conn, metrics);
                 addDamage(conn, metrics);
-                persistTables(conn, dbTemp);
+                MetricsDatabaseWriter.persist(conn, dbTemp);
             }
             AtomicFiles.replace(dbTemp, dbFile());
         } finally {
@@ -263,19 +229,8 @@ public final class MetricsRunner {
         });
     }
 
-    /** Latest per-player summary row (player index -> hero/name/team/final KDA + level). */
-    private static String rosterSql() {
-        return """
-            SELECT player, name, hero, hero_key, team, "level", kills, deaths, assists FROM (
-              SELECT player, name, hero, hero_key, team, "level", kills, deaths, assists,
-                     ROW_NUMBER() OVER (PARTITION BY player ORDER BY tick DESC) rn
-              FROM players_v
-            ) WHERE rn = 1 ORDER BY player
-            """;
-    }
-
     /**
-     * Lane inference from the first {@value LANE_WINDOW_SEC} seconds after the horn: each player's
+     * Lane inference from the first 90 seconds after the horn: each player's
      * samples are assigned to the top (x &lt; 0, y &gt; 0), bottom (x &gt; 0, y &lt; 0) or mid (x,y same sign)
      * map region; the region holding the majority of samples wins. Fountain trips are excluded and the
      * majority share is reported as a confidence percentage. Purely inferential (labelled as such in the
@@ -283,7 +238,6 @@ public final class MetricsRunner {
      */
     private Map<Integer, String[]> computeLanes(Connection conn) throws Exception {
         Map<Integer, String[]> lanes = new LinkedHashMap<>();
-        // lanePersistSql mirrors the Java decision in SQL so the persisted out.lanes table matches
         for (Map<String, Object> row : queryMaps(conn, lanePersistSql())) {
             lanes.put(intOf(row.get("player")),
                 new String[]{(String) row.get("lane"), String.valueOf(longOf(row.get("confidence")))});
@@ -291,62 +245,35 @@ public final class MetricsRunner {
         return lanes;
     }
 
-    private static String laneSql() {
-        return sql("""
-            SELECT player, COUNT(*) AS n,
-                   SUM(CASE WHEN x > 0 AND y < 0 THEN 1 ELSE 0 END) AS bottom_n,
-                   SUM(CASE WHEN x < 0 AND y > 0 THEN 1 ELSE 0 END) AS top_n,
-                   SUM(CASE WHEN (x > 0 AND y > 0) OR (x < 0 AND y < 0) THEN 1 ELSE 0 END) AS mid_n
-            FROM players_v
-            WHERE t >= 0 AND t <= {} AND team IN (2, 3)
-              AND NOT (hp IS NOT NULL AND hp <= 0)
-              AND x IS NOT NULL AND y IS NOT NULL AND x <> 0 AND y <> 0
-              AND NOT ((team = 2 AND x < -{} AND y < -{}) OR (team = 3 AND x > {} AND y > {}))
-            GROUP BY player
-            """, LANE_WINDOW_SEC, (long) FOUNTAIN_RADIUS, (long) FOUNTAIN_RADIUS,
-            (long) FOUNTAIN_RADIUS, (long) FOUNTAIN_RADIUS);
-    }
-
-    /** Lane decision + confidence per player (min sample filter included); drives JSON and out.lanes. */
-    private static String lanePersistSql() {
-        return sql("""
-            SELECT player, n,
-                   CASE WHEN bottom_n >= top_n AND bottom_n >= mid_n THEN 'bottom'
-                        WHEN top_n >= bottom_n AND top_n >= mid_n THEN 'top'
-                        ELSE 'mid' END AS lane,
-                   ROUND(100.0 * GREATEST(bottom_n, top_n, mid_n) / n) AS confidence
-            FROM ({})
-            WHERE n >= {}
-            """, laneSql(), MIN_LANE_SAMPLES);
-    }
-
     private void addKills(Connection conn, ObjectNode root) throws Exception {
         ArrayNode arr = root.putArray("kills");
         // batch-computed death costs: one query for every kill instead of two per kill
-        Map<String, ObjectNode> costByKill = new HashMap<>();
+        Map<Integer, ObjectNode> costByKill = new HashMap<>();
         for (Map<String, Object> cost : queryMaps(conn, deathCostBatchSql())) {
             ObjectNode c = MAPPER.createObjectNode();
             c.put("killer_team_gold", longOf(cost.get("gold")));
             c.put("killer_team_xp", longOf(cost.get("xp")));
-            costByKill.put(killKey(dbl(cost.get("kill_t")), (String) cost.get("victim_key")), c);
+            costByKill.put(intOf(cost.get("kill_id")), c);
         }
-        Map<String, ObjectNode> followByKill = new HashMap<>();
+        Map<Integer, ObjectNode> followByKill = new HashMap<>();
         for (Map<String, Object> obj : queryMaps(conn, concededObjectiveBatchSql())) {
             ObjectNode co = MAPPER.createObjectNode();
             co.put("t", round1(dbl(obj.get("obj_t"))));
             putStr(co, "target", (String) obj.get("obj_target"));
             putStr(co, "target_key", (String) obj.get("obj_target_key"));
             putStr(co, "kind", (String) obj.get("obj_kind"));
-            followByKill.put(killKey(dbl(obj.get("kill_t")), (String) obj.get("victim_key")), co);
+            followByKill.put(intOf(obj.get("kill_id")), co);
         }
         for (Map<String, Object> row : queryMaps(conn, """
-            SELECT t, raw_t, attacker, target, attacker_key, target_key, attacker_team, target_team, x, y, networth, assists
-            FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero
-            ORDER BY t
+            SELECT kill_id, t, raw_t, attacker, target, attacker_key, target_key,
+                   attacker_team, target_team, x, y, networth, assists
+            FROM hero_kills ORDER BY kill_id
             """)) {
             ObjectNode k = arr.addObject();
+            int killId = intOf(row.get("kill_id"));
             double t = dbl(row.get("t"));
             String victimKey = (String) row.get("target_key");
+            k.put("kill_id", killId);
             k.put("t", round1(t));
             k.put("raw_t", round1(dbl(row.get("raw_t"))));
             putStr(k, "killer", (String) row.get("attacker"));
@@ -371,12 +298,12 @@ public final class MetricsRunner {
                 }
             }
             if (killerTeam == 2 || killerTeam == 3) {
-                ObjectNode cost = costByKill.get(killKey(t, victimKey));
+                ObjectNode cost = costByKill.get(killId);
                 if (cost != null) {
                     k.put("killer_team_gold", cost.path("killer_team_gold").asLong());
                     k.put("killer_team_xp", cost.path("killer_team_xp").asLong());
                 }
-                ObjectNode follow = followByKill.get(killKey(t, victimKey));
+                ObjectNode follow = followByKill.get(killId);
                 if (follow != null) {
                     k.set("conceded_objective", follow);
                 }
@@ -384,60 +311,16 @@ public final class MetricsRunner {
         }
     }
 
-    private static String killKey(double t, String victimKey) {
-        return Double.toString(t) + "|" + victimKey;
-    }
-
-    /**
-     * Gold/XP each killer team accrued in the short window after a kill, attributed through hero_team.
-     * Includes passive income, last-hits and anything else landing in that window, so it is an
-     * approximation of the kill's reward (the true kill bounty is not exposed as a reliable field).
-     * Computed for every kill in one pass; the same SQL also feeds {@code out.death_costs}.
-     */
-    private String deathCostBatchSql() {
-        return sql("""
-            WITH kills AS (
-              SELECT t AS kill_t, target_key AS victim_key, attacker_team
-              FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero AND attacker_team IN (2, 3)
-            )
-            SELECT k.kill_t, k.victim_key,
-                   COALESCE(SUM(CASE WHEN c.type='DOTA_COMBATLOG_GOLD' AND ht.team = k.attacker_team THEN c.value END), 0) AS gold,
-                   COALESCE(SUM(CASE WHEN c.type='DOTA_COMBATLOG_XP' AND ht.team = k.attacker_team THEN c.value END), 0) AS xp
-            FROM kills k
-            LEFT JOIN combatlog_v c
-              ON c.t >= k.kill_t AND c.t <= k.kill_t + {} AND c.type IN ('DOTA_COMBATLOG_GOLD', 'DOTA_COMBATLOG_XP')
-            LEFT JOIN hero_team ht ON ht.hero_key = c.target_key
-            GROUP BY k.kill_t, k.victim_key
-            """, KILL_GOLD_WINDOW_SEC);
-    }
-
-    /**
-     * First objective (building or roshan) each killer team took in the follow-up window after a kill,
-     * or no row when none. A death that concedes a tower / roshan is the clearest "death cost" signal.
-     * Computed for every kill in one pass; the same SQL also feeds {@code out.conceded_objectives}.
-     */
-    private String concededObjectiveBatchSql() {
-        return sql("""
-            WITH kills AS (
-              SELECT t AS kill_t, target_key AS victim_key, attacker_team
-              FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero AND attacker_team IN (2, 3)
-            ),
-            objs AS (
-              SELECT t, target, target_key, 'building' AS kind, attacker_team
-              FROM combatlog_v WHERE type='DOTA_COMBATLOG_TEAM_BUILDING_KILL'
-              UNION ALL
-              SELECT t, 'npc_dota_roshan' AS target, 'roshan' AS target_key, 'roshan' AS kind, attacker_team
-              FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target LIKE 'npc_dota_roshan%'
-            ),
-            matched AS (
-              SELECT k.kill_t, k.victim_key, o.t AS obj_t, o.target AS obj_target,
-                     o.target_key AS obj_target_key, o.kind AS obj_kind,
-                     ROW_NUMBER() OVER (PARTITION BY k.kill_t, k.victim_key ORDER BY o.t) AS rn
-              FROM kills k
-              JOIN objs o ON o.attacker_team = k.attacker_team AND o.t >= k.kill_t AND o.t <= k.kill_t + {}
-            )
-            SELECT kill_t, victim_key, obj_t, obj_target, obj_target_key, obj_kind FROM matched WHERE rn = 1
-            """, KILL_FOLLOWUP_WINDOW_SEC);
+    /** Stable deterministic id for every hero death, shared by JSON and persisted derived tables. */
+    private void createHeroKills(Connection conn) throws Exception {
+        conn.createStatement().execute("""
+            CREATE TEMP TABLE hero_kills AS
+            SELECT ROW_NUMBER() OVER (
+                     ORDER BY t, target_key, attacker_key, target_team, attacker_team
+                   ) - 1 AS kill_id, *
+            FROM combatlog_v
+            WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero
+            """);
     }
 
     /** Latest team per hero key (teams 2/3 only); shared by economy and death-cost attribution. */
@@ -454,7 +337,10 @@ public final class MetricsRunner {
     private void addTeamfights(Connection conn, ObjectNode root) throws Exception {
         // shared with persistTables so the persisted tables mirror the JSON exactly
         conn.createStatement().execute("CREATE TEMP TABLE tf_episodes AS " + teamfightEpisodesSql());
+        conn.createStatement().execute("CREATE TEMP TABLE tf_events AS " + teamfightEventsBatchSql());
+        conn.createStatement().execute("CREATE TEMP TABLE tf_economy AS " + teamfightEconomyBatchSql());
         ArrayNode arr = root.putArray("teamfights");
+        Map<Integer, FightAccumulator> byId = new LinkedHashMap<>();
         for (Object[] row : query(conn, "SELECT id, start, \"end\", hero_damage, deaths FROM tf_episodes ORDER BY start")) {
             int id = intOf(row[0]);
             double start = dbl(row[1]);
@@ -466,156 +352,90 @@ public final class MetricsRunner {
             tf.put("duration", round1(end - start));
             tf.put("hero_damage", Math.round(dbl(row[3])));
             tf.put("deaths", longOf(row[4]));
+            byId.put(id, new FightAccumulator(tf));
+        }
+        for (Object[] row : query(conn,
+                "SELECT id, attacker_key, target_key, type, value FROM tf_events ORDER BY id, t")) {
+            FightAccumulator fight = byId.get(intOf(row[0]));
+            if (fight != null) {
+                fight.addEvent((String) row[1], (String) row[2], (String) row[3],
+                    row[4] == null ? 0 : dbl(row[4]));
+            }
+        }
+        for (Object[] row : query(conn, "SELECT id, team, gold, xp FROM tf_economy ORDER BY id, team")) {
+            FightAccumulator fight = byId.get(intOf(row[0]));
+            if (fight != null) {
+                fight.addEconomy(intOf(row[1]), longOf(row[2]), longOf(row[3]));
+            }
+        }
+        byId.values().forEach(FightAccumulator::finish);
+    }
 
-            List<Object[]> events = query(conn, sql(teamfightEventsSql(), start, end));
-            addEconomy(conn, tf, start, end);
-            Set<String> participants = new LinkedHashSet<>();
-            Map<String, double[]> playerStats = new LinkedHashMap<>();
-            for (Object[] event : events) {
-                String ak = (String) event[0];
-                String tk = (String) event[1];
-                String type = (String) event[2];
-                double value = event[3] == null ? 0 : ((Number) event[3]).doubleValue();
-                if (isHeroKey(ak)) {
-                    participants.add(ak);
+    private static final class FightAccumulator {
+        private final ObjectNode node;
+        private final Set<String> participants = new LinkedHashSet<>();
+        private final Map<String, double[]> playerStats = new LinkedHashMap<>();
+        private long radiantGold;
+        private long radiantXp;
+        private long direGold;
+        private long direXp;
+
+        private FightAccumulator(ObjectNode node) {
+            this.node = node;
+        }
+
+        private void addEvent(String attacker, String target, String type, double value) {
+            if (isHeroKey(attacker)) {
+                participants.add(attacker);
+            }
+            if (isHeroKey(target)) {
+                participants.add(target);
+            }
+            if ("DOTA_COMBATLOG_DAMAGE".equals(type)) {
+                if (isHeroKey(attacker)) {
+                    playerStats.computeIfAbsent(attacker, key -> new double[4])[0] += value;
                 }
-                if (isHeroKey(tk)) {
-                    participants.add(tk);
+                if (isHeroKey(target)) {
+                    playerStats.computeIfAbsent(target, key -> new double[4])[1] += value;
                 }
-                if ("DOTA_COMBATLOG_DAMAGE".equals(type)) {
-                    if (isHeroKey(ak)) {
-                        playerStats.computeIfAbsent(ak, key -> new double[4])[0] += value;
-                    }
-                    if (isHeroKey(tk)) {
-                        playerStats.computeIfAbsent(tk, key -> new double[4])[1] += value;
-                    }
-                } else if ("DOTA_COMBATLOG_DEATH".equals(type)) {
-                    if (isHeroKey(ak)) {
-                        playerStats.computeIfAbsent(ak, key -> new double[4])[2]++;
-                    }
-                    if (isHeroKey(tk)) {
-                        playerStats.computeIfAbsent(tk, key -> new double[4])[3]++;
-                    }
+            } else if ("DOTA_COMBATLOG_DEATH".equals(type)) {
+                if (isHeroKey(attacker)) {
+                    playerStats.computeIfAbsent(attacker, key -> new double[4])[2]++;
+                }
+                if (isHeroKey(target)) {
+                    playerStats.computeIfAbsent(target, key -> new double[4])[3]++;
                 }
             }
-            ArrayNode part = tf.putArray("participants");
-            participants.stream().sorted().forEach(part::add);
-            ObjectNode stats = tf.putObject("player_stats");
-            playerStats.forEach((hero, values) -> {
-                ObjectNode p = stats.putObject(hero);
-                p.put("damage_dealt", Math.round(values[0]));
-                p.put("damage_taken", Math.round(values[1]));
-                p.put("kills", (long) values[2]);
-                p.put("deaths", (long) values[3]);
-            });
         }
-    }
 
-    /** Episodes of elevated combat activity; the same SQL is used to populate metrics.duckdb. */
-    private static String teamfightEpisodesSql() {
-        String score = "dmg_events + " + WEIGHT_DEATH + " * deaths";
-        return """
-            WITH act AS (
-              SELECT FLOOR(t / {BUCKET}) * {BUCKET} AS b,
-                     COUNT(*) FILTER (WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND attacker LIKE 'npc_dota_hero_%') AS dmg_events,
-                     COUNT(*) FILTER (WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero) AS deaths
-              FROM combatlog_v
-              WHERE t >= (SELECT MIN(t) FROM combatlog_v)
-              GROUP BY 1
-            ),
-            scored AS (
-              SELECT b, {SCORE} AS score, ({SCORE} >= {MIN_ACTIVE}) AS active
-              FROM act
-            ),
-            lagged AS (
-              SELECT b, score, active,
-                     LAG(b) OVER (ORDER BY b) AS prev_b,
-                     LAG(active) OVER (ORDER BY b) AS prev_active
-              FROM scored
-            ),
-            islands AS (
-              SELECT b, score, active,
-                SUM(CASE WHEN active AND (NOT COALESCE(prev_active, false) OR b - prev_b > {BUCKET}) THEN 1 ELSE 0 END)
-                  OVER (ORDER BY b) AS grp
-              FROM lagged
-            ),
-            episodes AS (
-              SELECT grp, MIN(b) AS start_b, MAX(b) + {BUCKET} AS end_b
-              FROM islands WHERE active GROUP BY grp
-            )
-            SELECT ROW_NUMBER() OVER (ORDER BY start_b) - 1 AS id,
-                   start_b AS start, end_b AS end,
-                   COALESCE(SUM(CASE WHEN c.type='DOTA_COMBATLOG_DAMAGE' AND c.target_hero AND c.attacker LIKE 'npc_dota_hero_%' THEN c.value END), 0) AS hero_damage,
-                   COUNT(*) FILTER (WHERE c.type='DOTA_COMBATLOG_DEATH' AND c.target_hero) AS deaths
-            FROM episodes e JOIN combatlog_v c ON c.t >= e.start_b AND c.t <= e.end_b
-            GROUP BY e.grp, start_b, end_b ORDER BY start_b
-            """.replace("{BUCKET}", String.valueOf(BUCKET_SEC))
-            .replace("{MIN_ACTIVE}", String.valueOf(MIN_ACTIVE_SCORE))
-            .replace("{SCORE}", score);
-    }
-
-    /** Per-episode event rows used to assemble participants / per-player damage and kills. */
-    private static String teamfightEventsSql() {
-        return """
-            SELECT attacker_key, target_key, type, value
-            FROM combatlog_v
-            WHERE t >= {} AND t <= {} AND (
-                  (type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND attacker LIKE 'npc_dota_hero_%') OR
-                  (type='DOTA_COMBATLOG_DEATH' AND target_hero) OR
-                  (type='DOTA_COMBATLOG_HEAL' AND target_hero AND attacker LIKE 'npc_dota_hero_%'))
-            """;
-    }
-
-    /** Gold / XP each team's heroes gained inside a fight window, attributed via hero -> team. */
-    private void addEconomy(Connection conn, ObjectNode tf, double start, double end) throws Exception {
-        long radGold = 0, radXp = 0, direGold = 0, direXp = 0;
-        for (Object[] row : query(conn, sql(teamfightEconomySql(), start, end))) {
-            int team = intOf(row[0]);
+        private void addEconomy(int team, long gold, long xp) {
             if (team == 2) {
-                radGold = longOf(row[1]);
-                radXp = longOf(row[2]);
+                radiantGold = gold;
+                radiantXp = xp;
             } else if (team == 3) {
-                direGold = longOf(row[1]);
-                direXp = longOf(row[2]);
+                direGold = gold;
+                direXp = xp;
             }
         }
-        ObjectNode eco = tf.putObject("economy");
-        ObjectNode radiant = eco.putObject("radiant");
-        radiant.put("gold", radGold);
-        radiant.put("xp", radXp);
-        ObjectNode dire = eco.putObject("dire");
-        dire.put("gold", direGold);
-        dire.put("xp", direXp);
-        eco.put("gold_delta", radGold - direGold);
-        eco.put("xp_delta", radXp - direXp);
-    }
 
-    /** Per-team gold/XP sum for one fight window ({@code {}} start, end). */
-    private static String teamfightEconomySql() {
-        return """
-            SELECT ht.team,
-                   SUM(CASE WHEN c.type = 'DOTA_COMBATLOG_GOLD' THEN c.value END) AS gold,
-                   SUM(CASE WHEN c.type = 'DOTA_COMBATLOG_XP' THEN c.value END) AS xp
-            FROM combatlog_v c
-            JOIN hero_team ht ON ht.hero_key = c.target_key
-            WHERE c.t >= {} AND c.t <= {}
-              AND c.type IN ('DOTA_COMBATLOG_GOLD', 'DOTA_COMBATLOG_XP')
-            GROUP BY ht.team
-            """;
-    }
-
-    /** Same attribution as {@link #teamfightEconomySql()} but for every episode (persisted table). */
-    private static String teamfightEconomyPersistSql() {
-        return """
-            SELECT e.id, ht.team,
-                   COALESCE(SUM(CASE WHEN c.type = 'DOTA_COMBATLOG_GOLD' THEN c.value END), 0) AS gold,
-                   COALESCE(SUM(CASE WHEN c.type = 'DOTA_COMBATLOG_XP' THEN c.value END), 0) AS xp
-            FROM tf_episodes e
-            JOIN combatlog_v c ON c.t >= e.start AND c.t <= e."end"
-              AND c.type IN ('DOTA_COMBATLOG_GOLD', 'DOTA_COMBATLOG_XP')
-            JOIN hero_team ht ON ht.hero_key = c.target_key
-            GROUP BY e.id, ht.team ORDER BY e.id, ht.team
-            """;
+        private void finish() {
+            ArrayNode part = node.putArray("participants");
+            participants.stream().sorted().forEach(part::add);
+            ObjectNode stats = node.putObject("player_stats");
+            playerStats.entrySet().stream().sorted(Map.Entry.comparingByKey()).forEach(entry -> {
+                double[] values = entry.getValue();
+                ObjectNode player = stats.putObject(entry.getKey());
+                player.put("damage_dealt", Math.round(values[0]));
+                player.put("damage_taken", Math.round(values[1]));
+                player.put("kills", (long) values[2]);
+                player.put("deaths", (long) values[3]);
+            });
+            ObjectNode economy = node.putObject("economy");
+            economy.putObject("radiant").put("gold", radiantGold).put("xp", radiantXp);
+            economy.putObject("dire").put("gold", direGold).put("xp", direXp);
+            economy.put("gold_delta", radiantGold - direGold);
+            economy.put("xp_delta", radiantXp - direXp);
+        }
     }
 
     /**
@@ -716,21 +536,6 @@ public final class MetricsRunner {
         }
     }
 
-    /** One point per hero per 60 s bucket; MAX keeps the monotonic cumulative counters after resets. */
-    private static String farmCurvesSql() {
-        return """
-            SELECT hero_key AS hero, bucket,
-                   MAX(total_earned_gold) AS gold, MAX(last_hits) AS lh, MAX(denies) AS denies
-            FROM (
-              SELECT hero_key, t, total_earned_gold, last_hits, denies, FLOOR(t / 60.0) AS bucket
-              FROM players_v
-              WHERE hero_key IS NOT NULL AND team IN (2, 3)
-                AND total_earned_gold IS NOT NULL AND last_hits IS NOT NULL AND denies IS NOT NULL
-            )
-            GROUP BY hero, bucket ORDER BY hero, bucket
-            """;
-    }
-
     private void addGoldCurves(Connection conn, ObjectNode root) throws Exception {
         addCurves(conn, root, "gold_curves", "DOTA_COMBATLOG_GOLD", 30, "gold");
     }
@@ -759,20 +564,6 @@ public final class MetricsRunner {
         }
     }
 
-    /** Cumulative GOLD/XP per hero bucketed every {@code bucketSec} seconds. */
-    private static String curveSql(String type, int bucketSec) {
-        return sql("""
-            WITH src AS (
-              SELECT target_key AS hero, t, value FROM combatlog_v WHERE type='{}' AND value IS NOT NULL AND target_key IS NOT NULL
-            ),
-            cum AS (
-              SELECT hero, t, SUM(value) OVER (PARTITION BY hero ORDER BY t) AS cumv FROM src
-            )
-            SELECT hero, FLOOR(t / {}) * {} AS t_bucket, MAX(cumv) AS value
-            FROM cum GROUP BY hero, t_bucket ORDER BY hero, t_bucket
-            """, type, bucketSec, bucketSec);
-    }
-
     private void addItemTimeline(Connection conn, ObjectNode root) throws Exception {
         ArrayNode arr = root.putArray("item_timeline");
         List<Object[]> rows = query(conn, itemTimelineSql());
@@ -790,15 +581,6 @@ public final class MetricsRunner {
             putStr(it, "item", (String) row[1]);
             it.put("t", round1(dbl(row[2])));
         }
-    }
-
-    private static String itemTimelineSql() {
-        return """
-            SELECT target_key AS hero, value_name AS item, t
-            FROM combatlog_v
-            WHERE type='DOTA_COMBATLOG_PURCHASE' AND value_name IS NOT NULL AND target_key IS NOT NULL
-            ORDER BY target_key, t
-            """;
     }
 
     private void addDamage(Connection conn, ObjectNode root) throws Exception {
@@ -836,73 +618,6 @@ public final class MetricsRunner {
             node.put("taken_total", longOf(row[1]));
         }
         byHero.forEach((hero, node) -> node.put("dealt_total", totals.get(hero)[0]));
-    }
-
-    private static String damagePerMinuteSql() {
-        return """
-            SELECT attacker_key AS hero, FLOOR(t / 60) AS minute, SUM(value) AS dealt
-            FROM combatlog_v
-            WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero
-              AND attacker LIKE 'npc_dota_hero_%' AND attacker_key IS NOT NULL
-            GROUP BY attacker_key, minute ORDER BY attacker_key, minute
-            """;
-    }
-
-    private static String damageTakenSql() {
-        return """
-            SELECT target_key AS hero, SUM(value) AS taken_total
-            FROM combatlog_v
-            WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND target_key IS NOT NULL
-            GROUP BY target_key
-            """;
-    }
-
-    /** Per-hero dealt/taken totals, merged over both directions (mirrors the damage[] JSON section). */
-    private static String damageTotalsSql() {
-        return """
-            SELECT COALESCE(d.hero, t.hero) AS hero,
-                   COALESCE(d.dealt_total, 0) AS dealt_total,
-                   COALESCE(t.taken_total, 0) AS taken_total
-            FROM (SELECT attacker_key AS hero, SUM(value) AS dealt_total
-                  FROM combatlog_v
-                  WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero
-                    AND attacker LIKE 'npc_dota_hero_%' AND attacker_key IS NOT NULL
-                  GROUP BY attacker_key) d
-            FULL OUTER JOIN (SELECT target_key AS hero, SUM(value) AS taken_total
-                  FROM combatlog_v
-                  WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND target_key IS NOT NULL
-                  GROUP BY target_key) t ON d.hero = t.hero
-            ORDER BY hero
-            """;
-    }
-
-    private void persistTables(Connection conn, Path output) throws Exception {
-        try (Statement st = conn.createStatement()) {
-            st.execute("ATTACH '" + escape(output) + "' AS out (TYPE duckdb)");
-            st.execute("CREATE OR REPLACE TABLE out.combatlog AS SELECT * FROM combatlog_v");
-            st.execute("CREATE OR REPLACE TABLE out.players AS SELECT * FROM players_v");
-            st.execute("CREATE OR REPLACE TABLE out.kills AS SELECT * FROM combatlog_v " +
-                "WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero");
-            st.execute("CREATE OR REPLACE TABLE out.hero_damage AS SELECT * FROM combatlog_v " +
-                "WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero");
-            // the same SQL that drives the metrics.json sections, so ad-hoc SQL sees the real metrics
-            st.execute("CREATE OR REPLACE TABLE out.gold_curves AS " + curveSql("DOTA_COMBATLOG_GOLD", 30));
-            st.execute("CREATE OR REPLACE TABLE out.xp_curves AS " + curveSql("DOTA_COMBATLOG_XP", 60));
-            st.execute("CREATE OR REPLACE TABLE out.item_timeline AS " + itemTimelineSql());
-            st.execute("CREATE OR REPLACE TABLE out.damage_per_minute AS " + damagePerMinuteSql());
-            st.execute("CREATE OR REPLACE TABLE out.damage AS " + damageTotalsSql());
-            st.execute("CREATE OR REPLACE TABLE out.teamfights AS SELECT * FROM tf_episodes");
-            st.execute("CREATE OR REPLACE TABLE out.teamfight_economy AS " + teamfightEconomyPersistSql());
-            st.execute("CREATE OR REPLACE TABLE out.roshan_kills AS SELECT t, attacker, attacker_key, " +
-                "attacker_team FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target LIKE 'npc_dota_roshan%'");
-            st.execute("CREATE OR REPLACE TABLE out.building_kills AS SELECT t, target, target_team, " +
-                "attacker_team FROM combatlog_v WHERE type='DOTA_COMBATLOG_TEAM_BUILDING_KILL'");
-            st.execute("CREATE OR REPLACE TABLE out.farm_curves AS " + farmCurvesSql());
-            st.execute("CREATE OR REPLACE TABLE out.roster AS " + rosterSql());
-            st.execute("CREATE OR REPLACE TABLE out.lanes AS " + lanePersistSql());
-            st.execute("CREATE OR REPLACE TABLE out.death_costs AS " + deathCostBatchSql());
-            st.execute("CREATE OR REPLACE TABLE out.conceded_objectives AS " + concededObjectiveBatchSql());
-        }
     }
 
     // ------------------------------------------------------------------

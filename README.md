@@ -174,7 +174,7 @@ official hero-kill counter (with final roster deaths as a fallback for older ext
   "roster": [ {"player": 0, "name": "xiao8", "hero": "LoneDruid", "hero_key": "lone_druid", "team": 2,
                "side": "radiant", "level": 25, "kills": 3, "deaths": 3, "assists": 9,
                "lane": "top", "lane_confidence": 94} ],
-"kills": [ { "t": 884.9, "killer": "...", "killer_key": "marci", "victim": "...", "victim_key": "lone_druid",
+  "kills": [ { "kill_id": 0, "t": 884.9, "killer": "...", "killer_key": "marci", "victim": "...", "victim_key": "lone_druid",
                 "killer_team": 3, "victim_team": 2, "location": [-6111.0, -5903.0], "victim_networth": 870,
                 "assist_players": [9, 8, 5], "killer_team_gold": 284, "killer_team_xp": 120,
                 "conceded_objective": { "t": 892.4, "target": "npc_dota_badguys_tower1_top",
@@ -204,6 +204,8 @@ Notes:
 
 - `team_kills`, `kills` and teamfight `deaths` count **hero** deaths only (the raw combat log
   also records creep / tower / neutral deaths).
+- Every hero death has a stable `kill_id`, shared by `kills`, `death_costs` and
+  `conceded_objectives` for lossless DuckDB joins.
 - Hero keys are normalised snake_case (`npc_dota_hero_lone_druid` -> `lone_druid`) so the
   combat-log-derived sections join with `roster.hero_key`.
 - Each roster entry carries an inferred `lane` (`top` / `mid` / `bottom`) plus `lane_confidence`
