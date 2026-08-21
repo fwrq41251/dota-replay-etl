@@ -149,10 +149,11 @@ One row per player per sample:
 `dota-replay-etl metrics <out>/<matchId>` loads both NDJSON streams into an in-memory
 DuckDB, computes the metrics below, and writes `metrics.json` plus a persistent
 `metrics.duckdb`. The DuckDB file exposes the raw streams (`combatlog`, `players`,
-`kills`, `hero_damage`) and every computed metric as a table (`gold_curves`, `xp_curves`,
-`item_timeline`, `damage`, `damage_per_minute`, `teamfights`, `teamfight_economy`) built
-from the same SQL that drives the JSON sections, so ad-hoc SQL sees exactly the metrics
-the reports use.
+`kills`, `hero_damage`) and computed metrics as tables: `roster`, `lanes`, `gold_curves`,
+`xp_curves`, `farm_curves`, `item_timeline`, `damage`, `damage_per_minute`, `teamfights`,
+`teamfight_economy`, `death_costs`, `conceded_objectives`, `roshan_kills` and
+`building_kills`. Derived tables use the same SQL that drives the JSON sections, so ad-hoc
+SQL sees exactly the metrics the reports use.
 The inputs are validated up front: if a critical column (`t`, `type`, hero names/keys,
 teams, `value`, ...) is missing from either NDJSON file, the command fails with a clear
 error instead of producing silently wrong metrics (re-run `analyze` to regenerate).

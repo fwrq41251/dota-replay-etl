@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -231,7 +232,7 @@ public final class ReportGenerator {
               .append('|').append(last.path("total_earned_gold").asLong())
               .append('|').append(last.path("last_hits").asLong())
               .append('|').append(last.path("denies").asLong())
-              .append('|').append(String.format("%.1f", last.path("last_hits").asLong() / endMin))
+              .append('|').append(String.format(Locale.ROOT, "%.1f", last.path("last_hits").asLong() / endMin))
               .append("|\n");
         }
         sb.append('\n');
@@ -513,17 +514,17 @@ public final class ReportGenerator {
     }
 
     static String fmt(double v) {
-        return String.format("%.1f", v).replace(".0", "");
+        return String.format(Locale.ROOT, "%.1f", v).replace(".0", "");
     }
 
     /** Compact gold rendering: raw value below 10k, one-decimal "k" above (12500 -> "12.5k"). */
     static String fmtK(long v) {
-        return v >= 10000 ? String.format("%.1fk", v / 1000.0) : String.valueOf(v);
+        return v >= 10000 ? String.format(Locale.ROOT, "%.1fk", v / 1000.0) : String.valueOf(v);
     }
 
     static String gameTime(double seconds) {
         boolean negative = seconds < 0;
         long rounded = Math.round(Math.abs(seconds));
-        return (negative ? "-" : "") + (rounded / 60) + ":" + String.format("%02d", rounded % 60);
+        return (negative ? "-" : "") + (rounded / 60) + ":" + String.format(Locale.ROOT, "%02d", rounded % 60);
     }
 }

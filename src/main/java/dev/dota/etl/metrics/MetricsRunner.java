@@ -16,6 +16,7 @@ import java.sql.ResultSetMetaData;
 import java.sql.Statement;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -44,6 +45,29 @@ import java.util.Set;
 public final class MetricsRunner {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    /**
+     * SQL templating: replaces {@code {}} placeholders in order with {@code String.valueOf(args)}.
+     * Using a single placeholder style (instead of {@code %f}/{@code %d} String.format) keeps the
+     * output locale-independent (a comma-decimal locale would otherwise emit {@code 288,1} and break
+     * DuckDB parsing) and removes the {@code %%} escaping needed for LIKE wildcards in formatted().
+     * Only internal constants and generated SQL are interpolated; replay data is never inserted.
+     * The NDJSON file paths are escaped separately.
+     */
+    private static String sql(String template, Object... args) {
+        String out = template;
+        for (Object arg : args) {
+            int placeholder = out.indexOf("{}");
+            if (placeholder < 0) {
+                throw new IllegalArgumentException("too many SQL template arguments");
+            }
+            out = out.substring(0, placeholder) + arg + out.substring(placeholder + 2);
+        }
+        if (out.contains("{}")) {
+            throw new IllegalArgumentException("missing SQL template argument");
+        }
+        return out;
+    }
 
     // teamfight detection knobs
     private static final int BUCKET_SEC = 5;
@@ -88,6 +112,10 @@ public final class MetricsRunner {
         parameters.put("teamfight_bucket_sec", BUCKET_SEC);
         parameters.put("teamfight_death_weight", WEIGHT_DEATH);
         parameters.put("teamfight_min_active_score", MIN_ACTIVE_SCORE);
+        parameters.put("lane_window_sec", LANE_WINDOW_SEC);
+        parameters.put("lane_min_samples", MIN_LANE_SAMPLES);
+        parameters.put("kill_gold_window_sec", KILL_GOLD_WINDOW_SEC);
+        parameters.put("kill_followup_window_sec", KILL_FOLLOWUP_WINDOW_SEC);
         JsonNode match = readMatchJson();
         if (match.hasNonNull("source_replay_sha256")) {
             metrics.put("source_replay_sha256", match.path("source_replay_sha256").asText());
@@ -112,19 +140,19 @@ public final class MetricsRunner {
                       SELECT target AS name FROM combatlog WHERE target LIKE 'npc_dota_hero_%'
                     )
                     """);
-                conn.createStatement().execute(("""
-                    CREATE VIEW players_v AS SELECT * EXCLUDE(t), t AS raw_t, t - %f AS t,
+                conn.createStatement().execute(sql("""
+                    CREATE VIEW players_v AS SELECT * EXCLUDE(t), t AS raw_t, t - {} AS t,
                       COALESCE((SELECT hero_key FROM hero_key_map
                                 WHERE norm = lower(replace(hero, '_', ''))),
                                lower(regexp_replace(hero, '([a-z])([A-Z])', '\\1_\\2', 'g'))) AS hero_key
                     FROM players
-                    """).formatted(timeOffset));
-                conn.createStatement().execute(("""
-                    CREATE VIEW combatlog_v AS SELECT * EXCLUDE(t), t AS raw_t, t - %f AS t,
+                    """, timeOffset));
+                conn.createStatement().execute(sql("""
+                    CREATE VIEW combatlog_v AS SELECT * EXCLUDE(t), t AS raw_t, t - {} AS t,
                       replace(target, 'npc_dota_hero_', '') AS target_key,
                       replace(attacker, 'npc_dota_hero_', '') AS attacker_key
                     FROM combatlog
-                    """).formatted(timeOffset));
+                    """, timeOffset));
 
                 validateInputSchema(conn);
 
@@ -214,13 +242,7 @@ public final class MetricsRunner {
     private void addRoster(Connection conn, ObjectNode root) throws Exception {
         Map<Integer, String[]> lanes = computeLanes(conn);
         ArrayNode arr = root.putArray("roster");
-        queryMaps(conn, """
-            SELECT player, name, hero, hero_key, team, "level", kills, deaths, assists FROM (
-              SELECT player, name, hero, hero_key, team, "level", kills, deaths, assists,
-                     ROW_NUMBER() OVER (PARTITION BY player ORDER BY tick DESC) rn
-              FROM players_v
-            ) WHERE rn = 1 ORDER BY player
-            """).forEach(row -> {
+        queryMaps(conn, rosterSql()).forEach(row -> {
             ObjectNode p = arr.addObject();
             p.put("player", intOf(row.get("player")));
             putStr(p, "name", (String) row.get("name"));
@@ -241,6 +263,17 @@ public final class MetricsRunner {
         });
     }
 
+    /** Latest per-player summary row (player index -> hero/name/team/final KDA + level). */
+    private static String rosterSql() {
+        return """
+            SELECT player, name, hero, hero_key, team, "level", kills, deaths, assists FROM (
+              SELECT player, name, hero, hero_key, team, "level", kills, deaths, assists,
+                     ROW_NUMBER() OVER (PARTITION BY player ORDER BY tick DESC) rn
+              FROM players_v
+            ) WHERE rn = 1 ORDER BY player
+            """;
+    }
+
     /**
      * Lane inference from the first {@value LANE_WINDOW_SEC} seconds after the horn: each player's
      * samples are assigned to the top (x &lt; 0, y &gt; 0), bottom (x &gt; 0, y &lt; 0) or mid (x,y same sign)
@@ -250,47 +283,62 @@ public final class MetricsRunner {
      */
     private Map<Integer, String[]> computeLanes(Connection conn) throws Exception {
         Map<Integer, String[]> lanes = new LinkedHashMap<>();
-        for (Map<String, Object> row : queryMaps(conn, laneSql())) {
-            int player = intOf(row.get("player"));
-            long n = longOf(row.get("n"));
-            if (n < MIN_LANE_SAMPLES) {
-                continue;
-            }
-            long bottom = longOf(row.get("bottom_n"));
-            long top = longOf(row.get("top_n"));
-            long mid = longOf(row.get("mid_n"));
-            String lane;
-            if (bottom >= top && bottom >= mid) {
-                lane = "bottom";
-            } else if (top >= bottom && top >= mid) {
-                lane = "top";
-            } else {
-                lane = "mid";
-            }
-            long conf = Math.round(100.0 * Math.max(bottom, Math.max(top, mid)) / n);
-            lanes.put(player, new String[]{lane, String.valueOf(conf)});
+        // lanePersistSql mirrors the Java decision in SQL so the persisted out.lanes table matches
+        for (Map<String, Object> row : queryMaps(conn, lanePersistSql())) {
+            lanes.put(intOf(row.get("player")),
+                new String[]{(String) row.get("lane"), String.valueOf(longOf(row.get("confidence")))});
         }
         return lanes;
     }
 
     private static String laneSql() {
-        return ("""
+        return sql("""
             SELECT player, COUNT(*) AS n,
                    SUM(CASE WHEN x > 0 AND y < 0 THEN 1 ELSE 0 END) AS bottom_n,
                    SUM(CASE WHEN x < 0 AND y > 0 THEN 1 ELSE 0 END) AS top_n,
                    SUM(CASE WHEN (x > 0 AND y > 0) OR (x < 0 AND y < 0) THEN 1 ELSE 0 END) AS mid_n
             FROM players_v
-            WHERE t >= 0 AND t <= %d AND team IN (2, 3)
+            WHERE t >= 0 AND t <= {} AND team IN (2, 3)
               AND NOT (hp IS NOT NULL AND hp <= 0)
               AND x IS NOT NULL AND y IS NOT NULL AND x <> 0 AND y <> 0
-              AND NOT ((team = 2 AND x < -%d AND y < -%d) OR (team = 3 AND x > %d AND y > %d))
+              AND NOT ((team = 2 AND x < -{} AND y < -{}) OR (team = 3 AND x > {} AND y > {}))
             GROUP BY player
-            """).formatted(LANE_WINDOW_SEC, (long) FOUNTAIN_RADIUS, (long) FOUNTAIN_RADIUS,
+            """, LANE_WINDOW_SEC, (long) FOUNTAIN_RADIUS, (long) FOUNTAIN_RADIUS,
             (long) FOUNTAIN_RADIUS, (long) FOUNTAIN_RADIUS);
+    }
+
+    /** Lane decision + confidence per player (min sample filter included); drives JSON and out.lanes. */
+    private static String lanePersistSql() {
+        return sql("""
+            SELECT player, n,
+                   CASE WHEN bottom_n >= top_n AND bottom_n >= mid_n THEN 'bottom'
+                        WHEN top_n >= bottom_n AND top_n >= mid_n THEN 'top'
+                        ELSE 'mid' END AS lane,
+                   ROUND(100.0 * GREATEST(bottom_n, top_n, mid_n) / n) AS confidence
+            FROM ({})
+            WHERE n >= {}
+            """, laneSql(), MIN_LANE_SAMPLES);
     }
 
     private void addKills(Connection conn, ObjectNode root) throws Exception {
         ArrayNode arr = root.putArray("kills");
+        // batch-computed death costs: one query for every kill instead of two per kill
+        Map<String, ObjectNode> costByKill = new HashMap<>();
+        for (Map<String, Object> cost : queryMaps(conn, deathCostBatchSql())) {
+            ObjectNode c = MAPPER.createObjectNode();
+            c.put("killer_team_gold", longOf(cost.get("gold")));
+            c.put("killer_team_xp", longOf(cost.get("xp")));
+            costByKill.put(killKey(dbl(cost.get("kill_t")), (String) cost.get("victim_key")), c);
+        }
+        Map<String, ObjectNode> followByKill = new HashMap<>();
+        for (Map<String, Object> obj : queryMaps(conn, concededObjectiveBatchSql())) {
+            ObjectNode co = MAPPER.createObjectNode();
+            co.put("t", round1(dbl(obj.get("obj_t"))));
+            putStr(co, "target", (String) obj.get("obj_target"));
+            putStr(co, "target_key", (String) obj.get("obj_target_key"));
+            putStr(co, "kind", (String) obj.get("obj_kind"));
+            followByKill.put(killKey(dbl(obj.get("kill_t")), (String) obj.get("victim_key")), co);
+        }
         for (Map<String, Object> row : queryMaps(conn, """
             SELECT t, raw_t, attacker, target, attacker_key, target_key, attacker_team, target_team, x, y, networth, assists
             FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero
@@ -298,12 +346,13 @@ public final class MetricsRunner {
             """)) {
             ObjectNode k = arr.addObject();
             double t = dbl(row.get("t"));
+            String victimKey = (String) row.get("target_key");
             k.put("t", round1(t));
             k.put("raw_t", round1(dbl(row.get("raw_t"))));
             putStr(k, "killer", (String) row.get("attacker"));
             putStr(k, "killer_key", (String) row.get("attacker_key"));
             putStr(k, "victim", (String) row.get("target"));
-            putStr(k, "victim_key", (String) row.get("target_key"));
+            putStr(k, "victim_key", victimKey);
             int killerTeam = row.get("attacker_team") == null ? 0 : intOf(row.get("attacker_team"));
             k.put("killer_team", killerTeam);
             k.put("victim_team", intOf(row.get("target_team")));
@@ -322,55 +371,73 @@ public final class MetricsRunner {
                 }
             }
             if (killerTeam == 2 || killerTeam == 3) {
-                queryMaps(conn, deathCostSql().formatted(killerTeam, t, t + KILL_GOLD_WINDOW_SEC)).forEach(cost -> {
-                    k.put("killer_team_gold", longOf(cost.get("gold")));
-                    k.put("killer_team_xp", longOf(cost.get("xp")));
-                });
-                queryMaps(conn, concededObjectiveSql().formatted(
-                        t, t + KILL_FOLLOWUP_WINDOW_SEC, killerTeam, t, t + KILL_FOLLOWUP_WINDOW_SEC, killerTeam))
-                    .stream().findFirst().ifPresent(obj -> {
-                        ObjectNode co = k.putObject("conceded_objective");
-                        co.put("t", round1(dbl(obj.get("t"))));
-                        putStr(co, "target", (String) obj.get("target"));
-                        putStr(co, "target_key", (String) obj.get("target_key"));
-                        putStr(co, "kind", (String) obj.get("kind"));
-                    });
+                ObjectNode cost = costByKill.get(killKey(t, victimKey));
+                if (cost != null) {
+                    k.put("killer_team_gold", cost.path("killer_team_gold").asLong());
+                    k.put("killer_team_xp", cost.path("killer_team_xp").asLong());
+                }
+                ObjectNode follow = followByKill.get(killKey(t, victimKey));
+                if (follow != null) {
+                    k.set("conceded_objective", follow);
+                }
             }
         }
     }
 
-    /**
-     * Gold/XP the killer team accrued in the short window after a kill, attributed through hero_team.
-     * Includes passive income, last-hits and anything else landing in that window, so it is an
-     * approximation of the kill's reward (the true kill bounty is not exposed as a reliable field).
-     */
-    private String deathCostSql() {
-        return """
-            SELECT COALESCE(SUM(CASE WHEN c.type='DOTA_COMBATLOG_GOLD' THEN c.value END), 0) AS gold,
-                   COALESCE(SUM(CASE WHEN c.type='DOTA_COMBATLOG_XP' THEN c.value END), 0) AS xp
-            FROM combatlog_v c
-            JOIN hero_team ht ON ht.hero_key = c.target_key
-            WHERE ht.team = %d AND c.t >= %f AND c.t <= %f
-              AND c.type IN ('DOTA_COMBATLOG_GOLD','DOTA_COMBATLOG_XP')
-            """;
+    private static String killKey(double t, String victimKey) {
+        return Double.toString(t) + "|" + victimKey;
     }
 
     /**
-     * First objective (building or roshan) the killer team took in the follow-up window after a kill,
-     * or empty when none. A death that concedes a tower / roshan is the clearest "death cost" signal.
+     * Gold/XP each killer team accrued in the short window after a kill, attributed through hero_team.
+     * Includes passive income, last-hits and anything else landing in that window, so it is an
+     * approximation of the kill's reward (the true kill bounty is not exposed as a reliable field).
+     * Computed for every kill in one pass; the same SQL also feeds {@code out.death_costs}.
      */
-    private String concededObjectiveSql() {
-        return """
-            SELECT t, target, target_key, kind FROM (
-              SELECT t, target, target_key, 'building' AS kind
-              FROM combatlog_v
-              WHERE type='DOTA_COMBATLOG_TEAM_BUILDING_KILL' AND t >= %f AND t <= %f AND attacker_team = %d
+    private String deathCostBatchSql() {
+        return sql("""
+            WITH kills AS (
+              SELECT t AS kill_t, target_key AS victim_key, attacker_team
+              FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero AND attacker_team IN (2, 3)
+            )
+            SELECT k.kill_t, k.victim_key,
+                   COALESCE(SUM(CASE WHEN c.type='DOTA_COMBATLOG_GOLD' AND ht.team = k.attacker_team THEN c.value END), 0) AS gold,
+                   COALESCE(SUM(CASE WHEN c.type='DOTA_COMBATLOG_XP' AND ht.team = k.attacker_team THEN c.value END), 0) AS xp
+            FROM kills k
+            LEFT JOIN combatlog_v c
+              ON c.t >= k.kill_t AND c.t <= k.kill_t + {} AND c.type IN ('DOTA_COMBATLOG_GOLD', 'DOTA_COMBATLOG_XP')
+            LEFT JOIN hero_team ht ON ht.hero_key = c.target_key
+            GROUP BY k.kill_t, k.victim_key
+            """, KILL_GOLD_WINDOW_SEC);
+    }
+
+    /**
+     * First objective (building or roshan) each killer team took in the follow-up window after a kill,
+     * or no row when none. A death that concedes a tower / roshan is the clearest "death cost" signal.
+     * Computed for every kill in one pass; the same SQL also feeds {@code out.conceded_objectives}.
+     */
+    private String concededObjectiveBatchSql() {
+        return sql("""
+            WITH kills AS (
+              SELECT t AS kill_t, target_key AS victim_key, attacker_team
+              FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero AND attacker_team IN (2, 3)
+            ),
+            objs AS (
+              SELECT t, target, target_key, 'building' AS kind, attacker_team
+              FROM combatlog_v WHERE type='DOTA_COMBATLOG_TEAM_BUILDING_KILL'
               UNION ALL
-              SELECT t, 'npc_dota_roshan' AS target, 'roshan' AS target_key, 'roshan' AS kind
-              FROM combatlog_v
-              WHERE type='DOTA_COMBATLOG_DEATH' AND target LIKE 'npc_dota_roshan%%' AND t >= %f AND t <= %f AND attacker_team = %d
-            ) ORDER BY t LIMIT 1
-            """;
+              SELECT t, 'npc_dota_roshan' AS target, 'roshan' AS target_key, 'roshan' AS kind, attacker_team
+              FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target LIKE 'npc_dota_roshan%'
+            ),
+            matched AS (
+              SELECT k.kill_t, k.victim_key, o.t AS obj_t, o.target AS obj_target,
+                     o.target_key AS obj_target_key, o.kind AS obj_kind,
+                     ROW_NUMBER() OVER (PARTITION BY k.kill_t, k.victim_key ORDER BY o.t) AS rn
+              FROM kills k
+              JOIN objs o ON o.attacker_team = k.attacker_team AND o.t >= k.kill_t AND o.t <= k.kill_t + {}
+            )
+            SELECT kill_t, victim_key, obj_t, obj_target, obj_target_key, obj_kind FROM matched WHERE rn = 1
+            """, KILL_FOLLOWUP_WINDOW_SEC);
     }
 
     /** Latest team per hero key (teams 2/3 only); shared by economy and death-cost attribution. */
@@ -400,7 +467,7 @@ public final class MetricsRunner {
             tf.put("hero_damage", Math.round(dbl(row[3])));
             tf.put("deaths", longOf(row[4]));
 
-            List<Object[]> events = query(conn, teamfightEventsSql().formatted(start, end));
+            List<Object[]> events = query(conn, sql(teamfightEventsSql(), start, end));
             addEconomy(conn, tf, start, end);
             Set<String> participants = new LinkedHashSet<>();
             Map<String, double[]> playerStats = new LinkedHashMap<>();
@@ -492,17 +559,17 @@ public final class MetricsRunner {
         return """
             SELECT attacker_key, target_key, type, value
             FROM combatlog_v
-            WHERE t >= %f AND t <= %f AND (
-                  (type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND attacker LIKE 'npc_dota_hero_%%') OR
+            WHERE t >= {} AND t <= {} AND (
+                  (type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND attacker LIKE 'npc_dota_hero_%') OR
                   (type='DOTA_COMBATLOG_DEATH' AND target_hero) OR
-                  (type='DOTA_COMBATLOG_HEAL' AND target_hero AND attacker LIKE 'npc_dota_hero_%%'))
+                  (type='DOTA_COMBATLOG_HEAL' AND target_hero AND attacker LIKE 'npc_dota_hero_%'))
             """;
     }
 
     /** Gold / XP each team's heroes gained inside a fight window, attributed via hero -> team. */
     private void addEconomy(Connection conn, ObjectNode tf, double start, double end) throws Exception {
         long radGold = 0, radXp = 0, direGold = 0, direXp = 0;
-        for (Object[] row : query(conn, teamfightEconomySql().formatted(start, end))) {
+        for (Object[] row : query(conn, sql(teamfightEconomySql(), start, end))) {
             int team = intOf(row[0]);
             if (team == 2) {
                 radGold = longOf(row[1]);
@@ -523,7 +590,7 @@ public final class MetricsRunner {
         eco.put("xp_delta", radXp - direXp);
     }
 
-    /** Per-team gold/XP sum for one fight window ({@code %f} start, end). */
+    /** Per-team gold/XP sum for one fight window ({@code {}} start, end). */
     private static String teamfightEconomySql() {
         return """
             SELECT ht.team,
@@ -531,7 +598,7 @@ public final class MetricsRunner {
                    SUM(CASE WHEN c.type = 'DOTA_COMBATLOG_XP' THEN c.value END) AS xp
             FROM combatlog_v c
             JOIN hero_team ht ON ht.hero_key = c.target_key
-            WHERE c.t >= %f AND c.t <= %f
+            WHERE c.t >= {} AND c.t <= {}
               AND c.type IN ('DOTA_COMBATLOG_GOLD', 'DOTA_COMBATLOG_XP')
             GROUP BY ht.team
             """;
@@ -694,16 +761,16 @@ public final class MetricsRunner {
 
     /** Cumulative GOLD/XP per hero bucketed every {@code bucketSec} seconds. */
     private static String curveSql(String type, int bucketSec) {
-        return """
+        return sql("""
             WITH src AS (
-              SELECT target_key AS hero, t, value FROM combatlog_v WHERE type='%s' AND value IS NOT NULL AND target_key IS NOT NULL
+              SELECT target_key AS hero, t, value FROM combatlog_v WHERE type='{}' AND value IS NOT NULL AND target_key IS NOT NULL
             ),
             cum AS (
               SELECT hero, t, SUM(value) OVER (PARTITION BY hero ORDER BY t) AS cumv FROM src
             )
-            SELECT hero, FLOOR(t / %d) * %d AS t_bucket, MAX(cumv) AS value
+            SELECT hero, FLOOR(t / {}) * {} AS t_bucket, MAX(cumv) AS value
             FROM cum GROUP BY hero, t_bucket ORDER BY hero, t_bucket
-            """.formatted(type, bucketSec, bucketSec);
+            """, type, bucketSec, bucketSec);
     }
 
     private void addItemTimeline(Connection conn, ObjectNode root) throws Exception {
@@ -831,6 +898,10 @@ public final class MetricsRunner {
             st.execute("CREATE OR REPLACE TABLE out.building_kills AS SELECT t, target, target_team, " +
                 "attacker_team FROM combatlog_v WHERE type='DOTA_COMBATLOG_TEAM_BUILDING_KILL'");
             st.execute("CREATE OR REPLACE TABLE out.farm_curves AS " + farmCurvesSql());
+            st.execute("CREATE OR REPLACE TABLE out.roster AS " + rosterSql());
+            st.execute("CREATE OR REPLACE TABLE out.lanes AS " + lanePersistSql());
+            st.execute("CREATE OR REPLACE TABLE out.death_costs AS " + deathCostBatchSql());
+            st.execute("CREATE OR REPLACE TABLE out.conceded_objectives AS " + concededObjectiveBatchSql());
         }
     }
 
@@ -839,29 +910,8 @@ public final class MetricsRunner {
     // ------------------------------------------------------------------
 
     private Optional<Map<String, Object>> queryOne(Connection conn, String sql) throws Exception {
-        List<Object[]> rows = new ArrayList<>();
-        List<String> cols = new ArrayList<>();
-        try (Statement st = conn.createStatement(); ResultSet rs = st.executeQuery(sql)) {
-            ResultSetMetaData md = rs.getMetaData();
-            for (int i = 1; i <= md.getColumnCount(); i++) {
-                cols.add(md.getColumnLabel(i));
-            }
-            while (rs.next()) {
-                Object[] row = new Object[cols.size()];
-                for (int i = 0; i < cols.size(); i++) {
-                    row[i] = unwrap(rs.getObject(i + 1));
-                }
-                rows.add(row);
-            }
-        }
-        if (rows.isEmpty()) {
-            return Optional.empty();
-        }
-        Map<String, Object> map = new java.util.LinkedHashMap<>();
-        for (int i = 0; i < cols.size(); i++) {
-            map.put(cols.get(i), rows.get(0)[i]);
-        }
-        return Optional.of(map);
+        List<Map<String, Object>> rows = queryMaps(conn, sql);
+        return rows.isEmpty() ? Optional.empty() : Optional.of(rows.get(0));
     }
 
     private List<Map<String, Object>> queryMaps(Connection conn, String sql) throws Exception {

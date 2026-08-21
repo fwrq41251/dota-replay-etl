@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -260,7 +261,7 @@ public final class PlayerReviewGenerator {
                 if (t < from || t > deathRaw) {
                     continue;
                 }
-                String before = String.format("-%.1fs ", deathRaw - t);
+                String before = String.format(Locale.ROOT, "-%.1fs ", deathRaw - t);
                 if (hero.equals(attacker)
                     && ("DOTA_COMBATLOG_ABILITY".equals(type) || "DOTA_COMBATLOG_ITEM".equals(type))
                     && !"power_treads".equals(inflictor)) {
@@ -576,7 +577,7 @@ public final class PlayerReviewGenerator {
                 sb.append("- 打钱数据（玩家资源计数，权威）：累计获得金币 ")
                   .append(last.path("total_earned_gold").asLong())
                   .append("，补刀 ").append(last.path("last_hits").asLong())
-                  .append("（").append(String.format("%.1f", last.path("last_hits").asLong() / endMin))
+                  .append("（").append(String.format(Locale.ROOT, "%.1f", last.path("last_hits").asLong() / endMin))
                   .append("/分钟），反补 ").append(last.path("denies").asLong()).append('\n');
                 break;
             }

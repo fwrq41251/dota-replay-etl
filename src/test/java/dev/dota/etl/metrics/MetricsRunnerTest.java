@@ -12,6 +12,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -65,7 +66,7 @@ class MetricsRunnerTest {
     @Test
     void computesSummary() throws Exception {
         ObjectNode m = runMetrics();
-        assertEquals(7, m.path("schema_version").asInt());
+        assertEquals(8, m.path("schema_version").asInt());
         assertEquals(5, m.path("parameters").path("teamfight_bucket_sec").asInt());
         com.fasterxml.jackson.databind.JsonNode s = m.path("summary");
         assertEquals(2, s.path("team_kills").size());
@@ -73,6 +74,19 @@ class MetricsRunnerTest {
         assertEquals(1, s.path("team_kills").get(1).path("kills").asLong());   // dire killed pudge
         assertEquals(0, s.path("roshan_kills").asLong());
         assertEquals(0.0, s.path("game_start_sec").asDouble(), 1e-6);
+    }
+
+    @Test
+    void sqlTemplatesIgnoreDefaultLocale() throws Exception {
+        Locale previous = Locale.getDefault();
+        try {
+            Locale.setDefault(Locale.GERMANY);
+            ObjectNode m = runMetrics();
+            assertEquals(2, m.path("kills").size());
+            assertEquals(250, m.path("kills").get(0).path("killer_team_gold").asInt());
+        } finally {
+            Locale.setDefault(previous);
+        }
     }
 
     @Test
@@ -338,7 +352,8 @@ class MetricsRunnerTest {
             }
             for (String t : List.of("combatlog", "players", "kills", "hero_damage",
                 "gold_curves", "xp_curves", "item_timeline", "damage", "damage_per_minute",
-                "teamfights", "teamfight_economy", "roshan_kills", "building_kills", "farm_curves")) {
+                "teamfights", "teamfight_economy", "roshan_kills", "building_kills", "farm_curves",
+                "roster", "lanes", "death_costs", "conceded_objectives")) {
                 assertTrue(tables.contains(t), "expected persisted table " + t + " but got " + tables);
             }
             long teamfights = 0;
@@ -387,6 +402,20 @@ class MetricsRunnerTest {
                 }
             }
             assertTrue(farmHeroes >= 2, "farm_curves should contain both heroes");
+            long rosterRows = 0;
+            try (var rs = conn.createStatement().executeQuery("SELECT COUNT(*) FROM roster")) {
+                if (rs.next()) {
+                    rosterRows = rs.getLong(1);
+                }
+            }
+            assertEquals(2, rosterRows, "roster should contain both heroes");
+            long costRows = 0;
+            try (var rs = conn.createStatement().executeQuery("SELECT COUNT(*) FROM death_costs")) {
+                if (rs.next()) {
+                    costRows = rs.getLong(1);
+                }
+            }
+            assertEquals(m.path("kills").size(), costRows, "death_costs should cover every kill");
         }
     }
 

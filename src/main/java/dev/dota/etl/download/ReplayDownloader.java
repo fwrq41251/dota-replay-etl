@@ -20,6 +20,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
+import java.util.Locale;
 
 /**
  * Downloads Dota 2 replay files (.dem.bz2) from Valve's replay CDN.
@@ -85,7 +86,7 @@ public final class ReplayDownloader {
         ReplayInfo info = resolveReplayInfo(matchId);
         URI cdnUrl = info.replayUrl != null
             ? URI.create(info.replayUrl)
-            : URI.create(String.format(CDN_TEMPLATE, info.cluster, matchId, info.replaySalt));
+            : URI.create(String.format(Locale.ROOT, CDN_TEMPLATE, info.cluster, matchId, info.replaySalt));
 
         log.info("downloading replay {} from {}", matchId, cdnUrl);
         Path compressedTemp = AtomicFiles.createTempSibling(destDir.resolve(matchId + ".dem.compressed"));
@@ -234,7 +235,7 @@ public final class ReplayDownloader {
     private static String hex(byte[] b) {
         StringBuilder sb = new StringBuilder();
         for (byte x : b) {
-            sb.append(String.format("%02x ", x & 0xff));
+            sb.append(String.format(Locale.ROOT, "%02x ", x & 0xff));
         }
         return sb.toString().trim();
     }
