@@ -30,9 +30,13 @@ class MetricsRunnerTest {
         Path players = dir.resolve("players.ndjson");
 
         List<String> combatRows = List.of(
+            "{\"t\":95.0,\"type\":\"DOTA_COMBATLOG_ITEM\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"dota_unknown\",\"target_hero\":false,\"inflictor\":\"item_smoke_of_deceit\",\"value\":0,\"attacker_team\":2}",
+            "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_MODIFIER_REMOVE\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_pudge\",\"target_hero\":true,\"inflictor\":\"modifier_smoke_of_deceit\",\"value\":0,\"attacker_team\":2,\"target_team\":2}",
             // two heroes trade damage in a 5s bucket -> one teamfight episode
-            "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_DAMAGE\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"value\":120,\"attacker_team\":2,\"target_team\":3,\"x\":1.0,\"y\":2.0}",
+            "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_DAMAGE\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"inflictor\":\"pudge_rot\",\"value\":120,\"health\":780,\"attacker_team\":2,\"target_team\":3,\"x\":1.0,\"y\":2.0}",
             "{\"t\":101.0,\"type\":\"DOTA_COMBATLOG_DAMAGE\",\"attacker\":\"npc_dota_hero_axe\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_pudge\",\"target_hero\":true,\"value\":90,\"attacker_team\":3,\"target_team\":2}",
+            "{\"t\":101.5,\"type\":\"DOTA_COMBATLOG_ABILITY\",\"attacker\":\"npc_dota_hero_axe\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_pudge\",\"target_hero\":true,\"inflictor\":\"axe_berserkers_call\",\"value\":0,\"attacker_team\":3,\"target_team\":2}",
+            "{\"t\":101.6,\"type\":\"DOTA_COMBATLOG_MODIFIER_ADD\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"inflictor\":\"modifier_stunned\",\"value\":0,\"attacker_team\":2,\"target_team\":3}",
             "{\"t\":102.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"value\":300,\"attacker_team\":2,\"target_team\":3,\"networth\":1200,\"assists\":[0]}",
             "{\"t\":104.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_axe\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_pudge\",\"target_hero\":true,\"value\":300,\"attacker_team\":3,\"target_team\":2,\"networth\":1300,\"assists\":[1]}",
             "{\"t\":103.0,\"type\":\"DOTA_COMBATLOG_GOLD\",\"attacker\":\"dota_unknown\",\"target\":\"npc_dota_hero_pudge\",\"value\":250}",
@@ -62,6 +66,11 @@ class MetricsRunnerTest {
             "{\"t\":100.0,\"tick\":3000,\"player\":1,\"team\":3,\"name\":\"bob\",\"hero\":\"Axe\",\"level\":4,\"kills\":1,\"deaths\":2,\"assists\":1,\"x\":-100.0,\"y\":-100.0,\"z\":64.0,\"hp\":900.0,\"max_hp\":900.0,\"total_earned_gold\":1100,\"last_hits\":12,\"denies\":1}"
         );
         Files.write(players, playerRows);
+        Files.writeString(dir.resolve("wards.ndjson"),
+            "{\"ward_id\":\"w1\",\"type\":\"observer\",\"placed_t\":90.0,\"removed_t\":150.0," +
+            "\"lifetime_sec\":60.0,\"team\":2,\"player_owner_id\":0,\"player\":0," +
+            "\"x\":-120.0,\"y\":-120.0,\"z\":0.0,\"removal_reason\":\"destroyed\"," +
+            "\"destroyer\":\"npc_dota_hero_axe\",\"destroyer_team\":3}\n");
 
         return new MetricsRunner(combat, players).run();
     }
@@ -69,7 +78,7 @@ class MetricsRunnerTest {
     @Test
     void computesSummary() throws Exception {
         ObjectNode m = runMetrics();
-        assertEquals(9, m.path("schema_version").asInt());
+        assertEquals(12, m.path("schema_version").asInt());
         assertEquals(5, m.path("parameters").path("teamfight_bucket_sec").asInt());
         com.fasterxml.jackson.databind.JsonNode s = m.path("summary");
         assertEquals(2, s.path("team_kills").size());
@@ -77,6 +86,19 @@ class MetricsRunnerTest {
         assertEquals(1, s.path("team_kills").get(1).path("kills").asLong());   // dire killed pudge
         assertEquals(0, s.path("roshan_kills").asLong());
         assertEquals(0.0, s.path("game_start_sec").asDouble(), 1e-6);
+        assertEquals(2, m.path("incidents").path("deaths").size());
+        JsonNode incident = m.path("incidents").path("deaths").get(0);
+        assertEquals("death-0", incident.path("incident_id").asText());
+        assertEquals("axe", incident.path("victim_key").asText());
+        assertEquals(900, incident.path("first_observed_hp").asLong());
+        assertEquals("axe_berserkers_call", incident.path("victim_actions").get(0).path("name").asText());
+        assertEquals("modifier_stunned", incident.path("controls_received").get(0).path("modifier").asText());
+        assertTrue(!incident.path("damage_sources").isEmpty());
+        assertEquals("pudge", incident.path("nearby_heroes").get(0).path("hero").asText());
+        assertEquals("w1", incident.path("nearby_wards").get(0).path("ward_id").asText());
+        assertEquals("used", incident.path("smoke_events").get(0).path("event_type").asText());
+        assertEquals(1, m.path("vision").path("ward_summary").get(0).path("placed").asInt());
+        assertEquals(1, m.path("vision").path("players").get(1).path("dewards").asInt());
     }
 
     @Test
@@ -112,6 +134,10 @@ class MetricsRunnerTest {
         assertEquals("axe", first.path("victim_key").asText());
         assertEquals("pudge", first.path("killer_key").asText());
         assertEquals(1, first.path("assist_players").size());
+        assertEquals(-100.0, first.path("location").get(0).asDouble(), 1e-6);
+        assertEquals(-100.0, first.path("location").get(1).asDouble(), 1e-6);
+        assertEquals("player_sample", first.path("location_source").asText());
+        assertEquals(2.0, first.path("location_age_sec").asDouble(), 1e-6);
     }
 
     @Test
@@ -169,8 +195,9 @@ class MetricsRunnerTest {
         Path combat = dir.resolve("combatlog.ndjson");
         Path players = dir.resolve("players.ndjson");
         Files.write(combat, List.of(
-            // roshan death (radiant last hit) + two building kills (radiant destroys dire top tower, then fort)
+            // roshan death + a dire tower deny + two radiant building kills
             "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_roshan\",\"target_hero\":false,\"attacker_team\":2,\"target_team\":0,\"value\":165,\"x\":-1000.0,\"y\":-1000.0,\"networth\":1000,\"assists\":[]}",
+            "{\"t\":150.0,\"type\":\"DOTA_COMBATLOG_TEAM_BUILDING_KILL\",\"attacker\":\"dota_unknown\",\"attacker_hero\":false,\"target\":\"npc_dota_badguys_tower1_mid\",\"target_hero\":false,\"attacker_team\":3,\"target_team\":3,\"value\":1}",
             "{\"t\":200.0,\"type\":\"DOTA_COMBATLOG_TEAM_BUILDING_KILL\",\"attacker\":\"dota_unknown\",\"attacker_hero\":false,\"target\":\"npc_dota_badguys_tower1_top\",\"target_hero\":false,\"attacker_team\":2,\"target_team\":3,\"value\":1}",
             "{\"t\":300.0,\"type\":\"DOTA_COMBATLOG_TEAM_BUILDING_KILL\",\"attacker\":\"dota_unknown\",\"attacker_hero\":false,\"target\":\"npc_dota_badguys_fort\",\"target_hero\":false,\"attacker_team\":2,\"target_team\":3,\"value\":3}",
             "{\"t\":301.0,\"type\":\"DOTA_COMBATLOG_PURCHASE\",\"target\":\"npc_dota_hero_pudge\",\"target_key\":\"pudge\",\"value_name\":\"item_blinkdagger\"}"
@@ -188,13 +215,16 @@ class MetricsRunnerTest {
         assertEquals("pudge", rosh.get(0).path("killer_key").asText());
         assertEquals("radiant", rosh.get(0).path("side").asText());
         var bld = obj.path("building_kills");
-        assertEquals(2, bld.size());
-        assertEquals("badguys_tower1_top", bld.get(0).path("building_key").asText());
-        assertEquals("tower", bld.get(0).path("kind").asText());
-        assertEquals("dire", bld.get(0).path("owner_side").asText());
-        assertEquals("radiant", bld.get(0).path("destroyer_side").asText());
-        assertEquals("badguys_fort", bld.get(1).path("building_key").asText());
-        assertEquals("ancient", bld.get(1).path("kind").asText());
+        assertEquals(3, bld.size());
+        assertEquals("badguys_tower1_mid", bld.get(0).path("building_key").asText());
+        assertTrue(bld.get(0).path("denied").asBoolean());
+        assertEquals("badguys_tower1_top", bld.get(1).path("building_key").asText());
+        assertEquals("tower", bld.get(1).path("kind").asText());
+        assertEquals("dire", bld.get(1).path("owner_side").asText());
+        assertEquals("radiant", bld.get(1).path("destroyer_side").asText());
+        assertTrue(!bld.get(1).path("denied").asBoolean());
+        assertEquals("badguys_fort", bld.get(2).path("building_key").asText());
+        assertEquals("ancient", bld.get(2).path("kind").asText());
     }
 
     @Test
@@ -238,6 +268,7 @@ class MetricsRunnerTest {
             "{\"t\":100.5,\"type\":\"DOTA_COMBATLOG_GOLD\",\"target\":\"npc_dota_hero_pudge\",\"target_key\":\"pudge\",\"value\":250,\"gold_reason\":12}",
             "{\"t\":100.8,\"type\":\"DOTA_COMBATLOG_XP\",\"target\":\"npc_dota_hero_pudge\",\"target_key\":\"pudge\",\"value\":100}",
             "{\"t\":101.0,\"type\":\"DOTA_COMBATLOG_GOLD\",\"target\":\"npc_dota_hero_axe\",\"target_key\":\"axe\",\"value\":30,\"gold_reason\":12}",
+            "{\"t\":110.0,\"type\":\"DOTA_COMBATLOG_TEAM_BUILDING_KILL\",\"target\":\"npc_dota_goodguys_tower1_mid\",\"target_key\":\"goodguys_tower1_mid\",\"target_team\":2,\"attacker_team\":2}",
             "{\"t\":112.0,\"type\":\"DOTA_COMBATLOG_TEAM_BUILDING_KILL\",\"target\":\"npc_dota_badguys_tower1_top\",\"target_key\":\"badguys_tower1_top\",\"target_team\":3,\"attacker_team\":2}",
             // kill 2: axe (team 3) kills pudge; killer team takes roshan within 20s
             "{\"t\":120.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_axe\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_pudge\",\"target_hero\":true,\"attacker_team\":3,\"target_team\":2,\"value\":300,\"value_name\":\"none\",\"x\":1.0,\"y\":2.0,\"networth\":1300,\"assists\":[]}",
@@ -378,7 +409,11 @@ class MetricsRunnerTest {
             for (String t : List.of("combatlog", "players", "kills", "hero_damage",
                 "gold_curves", "xp_curves", "item_timeline", "damage", "damage_per_minute",
                 "teamfights", "teamfight_economy", "roshan_kills", "building_kills", "farm_curves",
-                "roster", "lanes", "death_costs", "conceded_objectives")) {
+                "roster", "lanes", "death_costs", "conceded_objectives", "death_incidents",
+                "incident_actions", "incident_controls", "incident_damage_sources",
+                "incident_health_timeline", "incident_vitals", "incident_nearby_heroes",
+                "incident_other_deaths", "wards", "ward_lifetimes", "dewards", "smoke_events",
+                "incident_vision", "incident_smoke_events")) {
                 assertTrue(tables.contains(t), "expected persisted table " + t + " but got " + tables);
             }
             long teamfights = 0;

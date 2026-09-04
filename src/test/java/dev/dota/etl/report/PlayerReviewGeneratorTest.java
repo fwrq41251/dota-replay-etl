@@ -63,6 +63,20 @@ class PlayerReviewGeneratorTest {
           .put("killer_key", "axe").put("victim_key", "pudge")
           .put("killer_team", 3).put("victim_team", 2).put("victim_networth", 1200);
 
+        ObjectNode incident = metrics.putObject("incidents").putArray("deaths").addObject();
+        incident.put("incident_id", "death-1").put("type", "hero_death").put("kill_id", 1)
+                .put("t", 200.0).put("killer", "npc_dota_hero_axe").put("victim_key", "pudge")
+                .put("first_observed_hp", 500);
+        incident.putArray("victim_actions").addObject().put("offset_sec", -5.0)
+                .put("action_type", "ability").put("name", "pudge_meat_hook");
+        incident.putArray("controls_received").addObject().put("offset_sec", -2.0)
+                .put("source", "axe").put("modifier", "modifier_stunned");
+        incident.putArray("damage_sources").addObject().put("source", "axe").put("damage", 500);
+        incident.putArray("health_timeline");
+        incident.putArray("nearby_heroes").addObject().put("hero", "axe").put("relation", "enemy")
+                .put("distance", 300);
+        incident.putArray("other_deaths");
+
         ArrayNode tfs = metrics.putArray("teamfights");
         ObjectNode tf = tfs.addObject();
         tf.put("id", 0).put("start", 115.0).put("end", 125.0).put("duration", 10.0)

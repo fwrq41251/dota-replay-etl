@@ -10,6 +10,8 @@ import skadistats.clarity.model.EngineId;
 import skadistats.clarity.model.Entity;
 import skadistats.clarity.model.FieldPath;
 import skadistats.clarity.processor.entities.Entities;
+import skadistats.clarity.processor.entities.OnEntityCreated;
+import skadistats.clarity.processor.entities.OnEntityDeleted;
 import skadistats.clarity.processor.entities.OnEntityUpdated;
 import skadistats.clarity.processor.entities.OnEntityPropertyChanged;
 import skadistats.clarity.processor.entities.UsesEntities;
@@ -20,6 +22,11 @@ import skadistats.clarity.processor.sendtables.DTClasses;
 import skadistats.clarity.processor.sendtables.OnDTClassesComplete;
 import skadistats.clarity.wire.dota.common.proto.DOTACombatLog;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -63,6 +70,7 @@ public class ExtractionProcessor {
 
     private final NdjsonWriter combatLogWriter;
     private final NdjsonWriter playersWriter;
+    private final NdjsonWriter wardsWriter;
     private final float sampleIntervalSec;
 
     private DTClass playerResourceClass;
@@ -85,12 +93,35 @@ public class ExtractionProcessor {
     private int gameWinner;
     private int radiantScore = -1;
     private int direScore = -1;
+    private final Map<Long, WardPlacement> wards = new LinkedHashMap<>();
+    private final List<WardDeathEvidence> wardDeaths = new ArrayList<>();
 
     public ExtractionProcessor(NdjsonWriter combatLogWriter, NdjsonWriter playersWriter,
-                               int sampleIntervalSec) {
+                               NdjsonWriter wardsWriter, int sampleIntervalSec) {
         this.combatLogWriter = combatLogWriter;
         this.playersWriter = playersWriter;
+        this.wardsWriter = wardsWriter;
         this.sampleIntervalSec = Math.max(1, sampleIntervalSec);
+    }
+
+    @OnEntityCreated(classPattern = "CDOTA_NPC_Observer_Ward(_TrueSight)?")
+    protected void onWardCreated(Entity e) {
+        String type = wardType(e.getDtClass().getDtName());
+        float[] position = entityPosition(e);
+        Float created = propertyFloat(e, "m_flCreateTime");
+        Integer ownerId = propertyInt(e, "m_nPlayerOwnerID");
+        wards.put((long) e.getUid(), new WardPlacement(
+            e.getUid(), type, created == null ? currentGameTime : created,
+            propertyInt(e, "m_iTeamNum"), ownerId,
+            playerIndexFromOwnerId(ownerId), position));
+    }
+
+    @OnEntityDeleted(classPattern = "CDOTA_NPC_Observer_Ward(_TrueSight)?")
+    protected void onWardDeleted(Entity e) {
+        WardPlacement ward = wards.get((long) e.getUid());
+        if (ward != null) {
+            ward.removedAt = currentGameTime;
+        }
     }
 
     @OnDTClassesComplete
@@ -213,6 +244,67 @@ public class ExtractionProcessor {
         }
         combatLogWriter.write(rec);
         combatLogCount++;
+
+        String target = str(cle.getTargetName());
+        String wardType = wardTypeFromCombatName(target);
+        if (type == DOTACombatLog.DOTA_COMBATLOG_TYPES.DOTA_COMBATLOG_DEATH && wardType != null) {
+            wardDeaths.add(new WardDeathEvidence(t, wardType,
+                cle.hasTargetTeam() ? cle.getTargetTeam() : null,
+                str(cle.getAttackerName()), cle.hasAttackerTeam() ? cle.getAttackerTeam() : null));
+        }
+    }
+
+    /** Finalizes one lifecycle row per ward after the replay has been fully consumed. */
+    public void finishWardEvents() {
+        List<WardPlacement> removed = new ArrayList<>(wards.values());
+        removed.removeIf(w -> w.removedAt == null);
+        removed.sort(Comparator.comparingDouble((WardPlacement w) -> w.removedAt).reversed());
+        boolean[] claimedDeaths = new boolean[wardDeaths.size()];
+        Map<Long, WardDeathEvidence> matchedDeaths = new LinkedHashMap<>();
+        for (WardPlacement ward : removed) {
+            WardDeathEvidence death = matchWardDeath(ward, claimedDeaths);
+            if (death != null) matchedDeaths.put(ward.uid, death);
+        }
+
+        List<WardPlacement> ordered = new ArrayList<>(wards.values());
+        ordered.sort(Comparator.comparingDouble(w -> w.createdAt));
+        for (WardPlacement ward : ordered) {
+            WardDeathEvidence death = matchedDeaths.get(ward.uid);
+            ObjectNode rec = wardsWriter.newRecord();
+            rec.put("ward_id", Long.toUnsignedString(ward.uid));
+            rec.put("type", ward.type);
+            rec.put("placed_t", round1(ward.createdAt));
+            Float removedAt = death == null ? ward.removedAt : Float.valueOf(death.t);
+            if (removedAt != null) {
+                rec.put("removed_t", round1(removedAt));
+                rec.put("lifetime_sec", round1(Math.max(0, removedAt - ward.createdAt)));
+            }
+            putNullable(rec, "team", ward.team);
+            putNullable(rec, "player_owner_id", ward.ownerId);
+            putNullable(rec, "player", ward.player);
+            if (ward.position != null) {
+                rec.put("x", round1(ward.position[0]));
+                rec.put("y", round1(ward.position[1]));
+                rec.put("z", round1(ward.position[2]));
+            } else {
+                rec.putNull("x");
+                rec.putNull("y");
+                rec.putNull("z");
+            }
+            if (death == null) {
+                rec.put("removal_reason", ward.removedAt == null ? "active_at_end" : "unknown");
+            } else {
+                boolean expired = death.attacker != null && death.attacker.equals(combatWardName(ward.type));
+                rec.put("removal_reason", expired ? "expired" : "destroyed");
+                putNullable(rec, "destroyer", death.attacker);
+                putNullable(rec, "destroyer_team", death.attackerTeam);
+            }
+            if (!rec.has("destroyer")) rec.putNull("destroyer");
+            if (!rec.has("destroyer_team")) rec.putNull("destroyer_team");
+            if (!rec.has("removed_t")) rec.putNull("removed_t");
+            if (!rec.has("lifetime_sec")) rec.putNull("lifetime_sec");
+            wardsWriter.write(rec);
+        }
     }
 
     @OnTickEnd
@@ -393,6 +485,11 @@ public class ExtractionProcessor {
         }
     }
 
+    private static void putNullable(ObjectNode node, String field, Object value) {
+        if (value == null) node.putNull(field);
+        else put(node, field, value);
+    }
+
     private static String str(String s) {
         return (s == null || s.isEmpty()) ? null : s;
     }
@@ -423,6 +520,29 @@ public class ExtractionProcessor {
         } catch (RuntimeException ex) {
             return null;
         }
+    }
+
+    private static Float propertyFloat(Entity e, String name) {
+        try {
+            Object value = e.hasProperty(name) ? e.getProperty(name) : null;
+            return value instanceof Number n ? n.floatValue() : null;
+        } catch (RuntimeException ex) {
+            return null;
+        }
+    }
+
+    private static float[] entityPosition(Entity e) {
+        Integer cellX = propertyInt(e, "CBodyComponent.m_cellX");
+        Integer cellY = propertyInt(e, "CBodyComponent.m_cellY");
+        Float vecX = propertyFloat(e, "CBodyComponent.m_vecX");
+        Float vecY = propertyFloat(e, "CBodyComponent.m_vecY");
+        if (cellX == null || cellY == null || vecX == null || vecY == null) {
+            return null;
+        }
+        Integer cellZ = propertyInt(e, "CBodyComponent.m_cellZ");
+        Float vecZ = propertyFloat(e, "CBodyComponent.m_vecZ");
+        float z = cellZ == null || vecZ == null ? 0 : positionComponent(cellZ, vecZ);
+        return new float[]{positionComponent(cellX, vecX), positionComponent(cellY, vecY), z};
     }
 
     private static Float floatOrNull(Entity e, FieldPath fp) {
@@ -479,6 +599,81 @@ public class ExtractionProcessor {
             }
         }
         return dtName;
+    }
+
+    static Integer playerIndexFromOwnerId(Integer ownerId) {
+        return ownerId != null && ownerId >= 0 && ownerId <= 18 && ownerId % 2 == 0
+            ? ownerId / 2 : null;
+    }
+
+    private static String wardType(String className) {
+        return className != null && className.endsWith("_TrueSight") ? "sentry" : "observer";
+    }
+
+    private static String wardTypeFromCombatName(String name) {
+        if ("npc_dota_observer_wards".equals(name)) {
+            return "observer";
+        }
+        if ("npc_dota_sentry_wards".equals(name)) {
+            return "sentry";
+        }
+        return null;
+    }
+
+    private static String combatWardName(String type) {
+        return "sentry".equals(type) ? "npc_dota_sentry_wards" : "npc_dota_observer_wards";
+    }
+
+    private WardDeathEvidence matchWardDeath(WardPlacement ward, boolean[] claimed) {
+        if (ward.removedAt == null) {
+            return null;
+        }
+        int best = -1;
+        float bestDelta = Float.MAX_VALUE;
+        for (int i = 0; i < wardDeaths.size(); i++) {
+            WardDeathEvidence death = wardDeaths.get(i);
+            if (claimed[i] || !ward.type.equals(death.type)
+                || (ward.team != null && death.team != null && !ward.team.equals(death.team))) {
+                continue;
+            }
+            float delta = ward.removedAt - death.t;
+            // Ward entities linger for several seconds after their combat-log death.
+            if (delta >= 0 && delta <= 15.0f && delta < bestDelta) {
+                best = i;
+                bestDelta = delta;
+            }
+        }
+        if (best < 0) {
+            return null;
+        }
+        claimed[best] = true;
+        return wardDeaths.get(best);
+    }
+
+    private static final class WardPlacement {
+        final long uid;
+        final String type;
+        final float createdAt;
+        final Integer team;
+        final Integer ownerId;
+        final Integer player;
+        final float[] position;
+        Float removedAt;
+
+        WardPlacement(long uid, String type, float createdAt, Integer team, Integer ownerId,
+                      Integer player, float[] position) {
+            this.uid = uid;
+            this.type = type;
+            this.createdAt = createdAt;
+            this.team = team;
+            this.ownerId = ownerId;
+            this.player = player;
+            this.position = position;
+        }
+    }
+
+    private record WardDeathEvidence(float t, String type, Integer team,
+                                     String attacker, Integer attackerTeam) {
     }
 
     // ------------------------------------------------------------------

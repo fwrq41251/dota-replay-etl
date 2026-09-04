@@ -78,6 +78,7 @@ and prompts for that match.
   match.json         match-level facts
   combatlog.ndjson   one JSON object per combat log entry
   players.ndjson     per-player state sampled every SEC seconds of in-game clock
+  wards.ndjson       one lifecycle row per observer/sentry ward
   metrics.json       computed metrics (from the `metrics` command)
   metrics.duckdb     same metrics as persisted DuckDB tables for ad-hoc SQL
   prompt.md          LLM review prompt (from the `report` command, dry-run)
@@ -89,7 +90,7 @@ and prompts for that match.
 ```json
 {
   "match_id": 6676393091,
-  "schema_version": 2,
+  "schema_version": 3,
   "etl_version": "0.1.0-SNAPSHOT",
   "source_replay_sha256": "...",
   "map_name": "start",
@@ -104,7 +105,8 @@ and prompts for that match.
   "winner_team": 3,
   "sample_interval_sec": 1,
   "combat_log_entries": 55020,
-  "player_samples": 25990
+  "player_samples": 25990,
+  "ward_lifecycles": 72
 }
 ```
 
@@ -144,15 +146,25 @@ One row per player per sample:
   Verified against combat-log locations (radiant fountain reads ≈ `(-6700, -6700)`).
 - `items.slot0..5` main inventory, `6..8` backpack, `9` neutral slot; empty slots are omitted.
 
+### wards.ndjson
+
+One row per observer or sentry ward, sourced from the actual ward entity rather than purchase
+events. Each row includes `ward_id`, `type`, owner `team` / `player`, `placed_t`, coordinates,
+and (when removed) `removed_t` / `lifetime_sec`. `removal_reason` is `destroyed`, `expired`,
+`unknown`, or `active_at_end`. Destruction/expiry is correlated with the ward death combat-log
+entry; `destroyer` and `destroyer_team` are retained for deward attribution. Timestamps are raw
+game timestamps in this extraction stream and are normalized to horn-relative time by metrics.
+
 ## Metrics
 
-`dota-replay-etl metrics <out>/<matchId>` loads both NDJSON streams into an in-memory
+`dota-replay-etl metrics <out>/<matchId>` loads the NDJSON streams into an in-memory
 DuckDB, computes the metrics below, and writes `metrics.json` plus a persistent
 `metrics.duckdb`. The DuckDB file exposes the raw streams (`combatlog`, `players`,
-`kills`, `hero_damage`) and computed metrics as tables: `roster`, `lanes`, `gold_curves`,
+`kills`, `hero_damage`, `wards`) and computed metrics as tables: `roster`, `lanes`, `gold_curves`,
 `xp_curves`, `farm_curves`, `item_timeline`, `damage`, `damage_per_minute`, `teamfights`,
 `teamfight_economy`, `death_costs`, `conceded_objectives`, `roshan_kills` and
-`building_kills`. Derived tables use the same SQL that drives the JSON sections, so ad-hoc
+`building_kills`, `ward_lifetimes`, `dewards`, `smoke_events`, `incident_vision` and
+`incident_smoke_events`. Derived tables use the same SQL that drives the JSON sections, so ad-hoc
 SQL sees exactly the metrics the reports use.
 The inputs are validated up front: if a critical column (`t`, `type`, hero names/keys,
 teams, `value`, ...) is missing from either NDJSON file, the command fails with a clear
@@ -229,9 +241,10 @@ Notes:
 - `objectives` is the objective timeline. `roshan_kills` lists every Roshan death with its time,
   the last-hitting hero and the killing team. `building_kills` lists every
   `DOTA_COMBATLOG_TEAM_BUILDING_KILL`: time, building entity, `kind` (`tower` / `rax` / `ancient`
-  / `base_tower` / `other`), owner team and destroying team (the fort / ancient death ends the
-  game). Building deaths are **facts** — the engine reports who destroyed whose, so reports can
-  correlate fights with objectives without the model guessing.
+  / `base_tower` / `other`), owner team, last-hit team and `denied`. Equal owner/last-hit teams
+  are reported as building denies rather than enemy objectives (the fort / ancient death ends the
+  game). Building events are **facts**, so reports can correlate fights with objectives without
+  the model guessing.
 - `farm_curves` comes straight from the authoritative player resource (`CDOTA_PlayerResource`),
   not reconstructed from GOLD events: per hero, cumulative `total_earned_gold`, `last_hits` and
   `denies`, bucketed every 60 s (bucket centre time, MAX per bucket keeps the monotonic counters
@@ -244,9 +257,25 @@ Notes:
   negative). `conceded_objective` (when present) is the first building or Roshan the killer team
   took within 20 s of the death — an objective conceded off a kill is factual and is the clearest
   death-cost signal. Knobs: `KILL_GOLD_WINDOW_SEC`, `KILL_FOLLOWUP_WINDOW_SEC` in `MetricsRunner`.
+  When the death combat-log event lacks coordinates, `location` falls back to the victim's latest
+  player-state sample from at most 5 seconds earlier and is explicitly labelled with
+  `location_source: player_sample` plus `location_age_sec`; reports render it as approximate.
 - `damage` is per-hero hero-to-hero damage: `dealt_total` (attacker is a hero), `taken_total`
   (target is a hero, any source), and `per_minute` buckets of damage dealt. Drives the
   single-player review's engagement windows.
+- `incidents.deaths` is the standardized evidence package for every hero death. Each stable
+  `death-<kill_id>` record contains the 15 seconds before death (victim ability/item actions,
+  controls received, damage sources and health observations), living heroes sampled within 2500
+  world units, active wards within 2500 units, nearby smoke events, other deaths from 15 seconds
+  before through 5 seconds after, the last recorded BKB use and any follow-up objective.
+  A nearby ward is spatial evidence only and does not prove line of sight through terrain or trees.
+  Sample-derived positions and distances retain their age/source
+  metadata and are explicitly approximate. The same evidence is persisted as the DuckDB tables
+  `death_incidents` and `incident_*` for ad-hoc analysis.
+- `vision` summarizes observer/sentry placements by team, per-player placements and dewards,
+  individual deward events, smoke uses and smoke modifiers that ended before their normal 45-second
+  duration (`broken_early`). Early removal is evidence that smoke ended, not proof of its precise
+  cause (enemy proximity, an attack, death, and other game interactions are not distinguished).
 
 ## LLM review prompt (`report`)
 
@@ -280,8 +309,11 @@ and per-team gold change per fight), and a farming/position table derived from `
 (the hero's inferred lane with its confidence is shown at the top; the table reports the share
 of time spent in the enemy half and deep in enemy territory per game phase, split along the
 river diagonal).
-It also includes each death's preceding 15-second cast, control, damage-source, and last-BKB-use
-evidence, plus per-fight personal damage dealt/taken. The 打钱/位置分析 section opens with the
+It also includes each death's standardized incident evidence: preceding 15-second casts,
+control and damage sources, nearby living heroes and ward entities, nearby smoke events, other
+deaths in the window, and last-BKB-use. A separate vision section lists the player's ward and
+deward counts plus the team's smoke timeline;
+older metrics fall back to scanning the raw combat log. The 打钱/位置分析 section opens with the
 hero's authoritative farm totals (cumulative earned gold, last hits + per-minute pace, denies)
 from the player resource. A **本方目标进度** section lists the
 Roshan kills and building destroys performed by the hero's team, so the review can judge whether
@@ -294,6 +326,8 @@ prioritised improvement list. Position facts are skipped when `players.ndjson` i
 `ExtractionProcessor` is an annotation-driven clarity runner processor:
 
 - `@OnCombatLogEntry` writes every combat log entry.
+- `@OnEntityCreated` / `@OnEntityDeleted` track observer and sentry ward lifecycles; ward death
+  combat-log entries distinguish natural expiry from destruction and identify the destroyer.
 - `@OnEntityUpdated` watches `CDOTA_PlayerResource` for the selected hero handle.
   Assignment is deferred to `@OnTickEnd` because the hero entity spawns after the
   PlayerResource update within the same tick.

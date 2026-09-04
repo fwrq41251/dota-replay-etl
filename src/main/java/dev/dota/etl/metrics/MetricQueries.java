@@ -11,6 +11,10 @@ final class MetricQueries {
     static final int MIN_LANE_SAMPLES = 10;
     static final double KILL_GOLD_WINDOW_SEC = 2.0;
     static final double KILL_FOLLOWUP_WINDOW_SEC = 20.0;
+    static final double KILL_LOCATION_MAX_AGE_SEC = 5.0;
+    static final double DEATH_INCIDENT_BEFORE_SEC = 15.0;
+    static final double DEATH_INCIDENT_AFTER_SEC = 5.0;
+    static final double DEATH_INCIDENT_NEARBY_RADIUS = 2500.0;
 
     /** Locale-independent template replacement for internal constants and generated SQL only. */
     static String sql(String template, Object... args) {
@@ -84,7 +88,10 @@ final class MetricQueries {
         return sql("""
             WITH objs AS (
               SELECT t, target, target_key, 'building' AS kind, attacker_team
-              FROM combatlog_v WHERE type='DOTA_COMBATLOG_TEAM_BUILDING_KILL'
+              FROM combatlog_v
+              WHERE type='DOTA_COMBATLOG_TEAM_BUILDING_KILL'
+                AND attacker_team IN (2, 3) AND target_team IN (2, 3)
+                AND attacker_team <> target_team
               UNION ALL
               SELECT t, 'npc_dota_roshan' AS target, 'roshan' AS target_key, 'roshan' AS kind, attacker_team
               FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target LIKE 'npc_dota_roshan%'

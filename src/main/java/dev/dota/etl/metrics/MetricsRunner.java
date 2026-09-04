@@ -58,14 +58,16 @@ public final class MetricsRunner {
         "attacker_team", "target_team", "value");
     private static final List<String> REQUIRED_PLAYERS_COLUMNS = List.of(
         "t", "tick", "player", "team", "hero", "name", "level", "kills", "deaths", "assists",
-        "total_earned_gold", "last_hits", "denies");
+        "total_earned_gold", "last_hits", "denies", "x", "y");
 
     private final Path combatLog;
     private final Path players;
+    private final Path wards;
 
     public MetricsRunner(Path combatLog, Path players) {
         this.combatLog = combatLog;
         this.players = players;
+        this.wards = combatLog.getParent().resolve("wards.ndjson");
     }
 
     public ObjectNode run() throws Exception {
@@ -81,6 +83,10 @@ public final class MetricsRunner {
         parameters.put("lane_min_samples", MIN_LANE_SAMPLES);
         parameters.put("kill_gold_window_sec", KILL_GOLD_WINDOW_SEC);
         parameters.put("kill_followup_window_sec", KILL_FOLLOWUP_WINDOW_SEC);
+        parameters.put("kill_location_max_age_sec", KILL_LOCATION_MAX_AGE_SEC);
+        parameters.put("death_incident_before_sec", DEATH_INCIDENT_BEFORE_SEC);
+        parameters.put("death_incident_after_sec", DEATH_INCIDENT_AFTER_SEC);
+        parameters.put("death_incident_nearby_radius", DEATH_INCIDENT_NEARBY_RADIUS);
         JsonNode match = readMatchJson();
         if (match.hasNonNull("source_replay_sha256")) {
             metrics.put("source_replay_sha256", match.path("source_replay_sha256").asText());
@@ -94,6 +100,7 @@ public final class MetricsRunner {
                     "CREATE VIEW combatlog AS SELECT * FROM read_ndjson('" + escape(combatLog) + "')");
                 conn.createStatement().execute(
                     "CREATE VIEW players AS SELECT * FROM read_ndjson('" + escape(players) + "')");
+                createWardsView(conn);
                 conn.createStatement().execute("""
                     CREATE TEMP TABLE hero_key_map AS
                     SELECT DISTINCT
@@ -118,6 +125,12 @@ public final class MetricsRunner {
                       replace(attacker, 'npc_dota_hero_', '') AS attacker_key
                     FROM combatlog
                     """, timeOffset));
+                conn.createStatement().execute(sql("""
+                    CREATE VIEW wards_v AS SELECT * EXCLUDE(placed_t, removed_t),
+                      placed_t AS raw_placed_t, placed_t - {} AS placed_t,
+                      removed_t AS raw_removed_t, removed_t - {} AS removed_t
+                    FROM wards
+                    """, timeOffset, timeOffset));
 
                 validateInputSchema(conn);
 
@@ -125,7 +138,9 @@ public final class MetricsRunner {
                 addSummary(conn, metrics, match, timeOffset);
                 addRoster(conn, metrics);
                 createHeroTeam(conn);
+                new VisionMetricsBuilder(conn).addTo(metrics);
                 addKills(conn, metrics);
+                new DeathIncidentBuilder(conn).addTo(metrics);
                 addTeamfights(conn, metrics);
                 addObjectives(conn, metrics);
                 addFarmCurves(conn, metrics);
@@ -266,7 +281,8 @@ public final class MetricsRunner {
         }
         for (Map<String, Object> row : queryMaps(conn, """
             SELECT kill_id, t, raw_t, attacker, target, attacker_key, target_key,
-                   attacker_team, target_team, x, y, networth, assists
+                   attacker_team, target_team, x, y, location_source, location_age_sec,
+                   networth, assists
             FROM hero_kills ORDER BY kill_id
             """)) {
             ObjectNode k = arr.addObject();
@@ -287,6 +303,10 @@ public final class MetricsRunner {
                 ArrayNode loc = k.putArray("location");
                 loc.add(round1(dbl(row.get("x"))));
                 loc.add(round1(dbl(row.get("y"))));
+                putStr(k, "location_source", (String) row.get("location_source"));
+                if (row.get("location_age_sec") != null) {
+                    k.put("location_age_sec", round1(dbl(row.get("location_age_sec"))));
+                }
             }
             if (row.get("networth") != null) {
                 k.put("victim_networth", longOf(row.get("networth")));
@@ -313,22 +333,42 @@ public final class MetricsRunner {
 
     /** Stable deterministic id for every hero death, shared by JSON and persisted derived tables. */
     private void createHeroKills(Connection conn) throws Exception {
-        conn.createStatement().execute("""
+        conn.createStatement().execute(sql("""
             CREATE TEMP TABLE hero_kills AS
-            SELECT ROW_NUMBER() OVER (
-                     ORDER BY t, target_key, attacker_key, target_team, attacker_team
-                   ) - 1 AS kill_id, *
-            FROM combatlog_v
-            WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero
-            """);
+            WITH deaths AS (
+              SELECT ROW_NUMBER() OVER (
+                       ORDER BY t, target_key, attacker_key, target_team, attacker_team
+                     ) - 1 AS kill_id, *
+              FROM combatlog_v
+              WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero
+            )
+            SELECT d.* EXCLUDE (x, y),
+                   COALESCE(d.x, p.x) AS x,
+                   COALESCE(d.y, p.y) AS y,
+                   CASE WHEN d.x IS NOT NULL AND d.y IS NOT NULL THEN 'combatlog'
+                        WHEN p.x IS NOT NULL AND p.y IS NOT NULL THEN 'player_sample'
+                   END AS location_source,
+                   CASE WHEN d.x IS NULL OR d.y IS NULL THEN d.t - p.t END AS location_age_sec
+            FROM deaths d
+            LEFT JOIN LATERAL (
+              SELECT ps.t, ps.x, ps.y
+              FROM players_v ps
+              WHERE ps.hero_key = d.target_key
+                AND ps.x IS NOT NULL AND ps.y IS NOT NULL
+                AND ps.x <> 0 AND ps.y <> 0
+                AND ps.t <= d.t AND d.t - ps.t <= {}
+              ORDER BY ps.t DESC LIMIT 1
+            ) p ON true
+            """, KILL_LOCATION_MAX_AGE_SEC));
     }
 
     /** Latest team per hero key (teams 2/3 only); shared by economy and death-cost attribution. */
     private void createHeroTeam(Connection conn) throws Exception {
         conn.createStatement().execute("""
             CREATE TEMP TABLE hero_team AS
-            SELECT hero_key, team FROM (
-              SELECT hero_key, team, ROW_NUMBER() OVER (PARTITION BY hero_key ORDER BY tick DESC) rn
+            SELECT hero_key, team, player FROM (
+              SELECT hero_key, team, player,
+                     ROW_NUMBER() OVER (PARTITION BY hero_key ORDER BY tick DESC) rn
               FROM players_v WHERE hero_key IS NOT NULL AND team IN (2, 3)
             ) WHERE rn = 1
             """);
@@ -442,7 +482,8 @@ public final class MetricsRunner {
      * Objective timeline: roshan kills (who got the last hit, when) and building kills (towers / rax /
      * ancient / base towers, who destroyed whose). Every building kill is reported by the engine as
      * {@code DOTA_COMBATLOG_TEAM_BUILDING_KILL} with the destroying team in {@code attacker_team} and the
-     * owner in {@code target_team}; the fort (ancient) death ends the game.
+     * owner in {@code target_team}. Equal attacker/owner teams denote a deny rather than an enemy
+     * objective; the fort (ancient) death ends the game.
      */
     private void addObjectives(Connection conn, ObjectNode root) throws Exception {
         ObjectNode obj = root.putObject("objectives");
@@ -482,6 +523,7 @@ public final class MetricsRunner {
             int destroyer = intOf(row.get("attacker_team"));
             b.put("destroyer_team", destroyer);
             b.put("destroyer_side", teamSide(destroyer));
+            b.put("denied", (owner == 2 || owner == 3) && owner == destroyer);
         });
     }
 
@@ -717,6 +759,22 @@ public final class MetricsRunner {
     private void validateInputSchema(Connection conn) throws Exception {
         validateColumns("combatlog.ndjson", columnsOf(conn, "combatlog"), REQUIRED_COMBATLOG_COLUMNS);
         validateColumns("players.ndjson", columnsOf(conn, "players"), REQUIRED_PLAYERS_COLUMNS);
+    }
+
+    private void createWardsView(Connection conn) throws Exception {
+        if (Files.exists(wards) && Files.size(wards) > 0) {
+            conn.createStatement().execute(
+                "CREATE VIEW wards AS SELECT * FROM read_ndjson('" + escape(wards) + "')");
+            return;
+        }
+        conn.createStatement().execute("""
+            CREATE TEMP TABLE wards (
+              ward_id VARCHAR, type VARCHAR, placed_t DOUBLE, removed_t DOUBLE,
+              lifetime_sec DOUBLE, team INTEGER, player_owner_id INTEGER, player INTEGER,
+              x DOUBLE, y DOUBLE, z DOUBLE, removal_reason VARCHAR,
+              destroyer VARCHAR, destroyer_team INTEGER
+            )
+            """);
     }
 
     /** Union of field names across the whole NDJSON file, as materialised by read_ndjson. */

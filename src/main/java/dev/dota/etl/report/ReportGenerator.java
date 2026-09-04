@@ -70,6 +70,7 @@ public final class ReportGenerator {
 
         appendSummary(sb, metrics, match);
         appendRoster(sb, metrics);
+        appendVision(sb, metrics);
         appendEconomy(sb, metrics);
         appendKills(sb, metrics);
         appendTeamfights(sb, metrics);
@@ -207,6 +208,35 @@ public final class ReportGenerator {
         appendFarmTable(sb, m, teamByHero);
     }
 
+    private void appendVision(StringBuilder sb, JsonNode m) {
+        if (!m.path("vision").isObject()) return;
+        Map<Integer, String> heroByPlayer = new LinkedHashMap<>();
+        for (JsonNode player : m.path("roster")) {
+            heroByPlayer.put(player.path("player").asInt(), player.path("hero_key").asText("?"));
+        }
+        sb.append("## 视野与辅助行为\n\n");
+        sb.append("守卫来自实体生命周期；附近眼位不等于实际视野（未计算高低坡和树木遮挡）。")
+          .append("烟雾提前失效仅表示 modifier 在 45 秒前移除，不能单独证明原因。\n\n");
+        sb.append("| 选手 | 侦察守卫 | 岗哨守卫 | 排眼 |\n|---|---:|---:|---:|\n");
+        for (JsonNode row : m.path("vision").path("players")) {
+            sb.append('|').append(heroByPlayer.getOrDefault(row.path("player").asInt(), "?"))
+              .append('|').append(row.path("observer_wards").asLong())
+              .append('|').append(row.path("sentry_wards").asLong())
+              .append('|').append(row.path("dewards").asLong()).append("|\n");
+        }
+        sb.append("\n烟雾事件：");
+        boolean any = false;
+        for (JsonNode row : m.path("vision").path("smoke_events")) {
+            if (any) sb.append("；");
+            sb.append(gameTime(row.path("t").asDouble())).append(' ')
+              .append(side(row.path("team").asInt())).append(' ')
+              .append("used".equals(row.path("event_type").asText()) ? "开雾" : "提前失效");
+            any = true;
+        }
+        if (!any) sb.append("无");
+        sb.append("\n\n");
+    }
+
     /** Authoritative per-hero farm totals from the player resource (not reconstructed from GOLD events). */
     private void appendFarmTable(StringBuilder sb, JsonNode m, Map<String, Integer> teamByHero) {
         List<JsonNode> rows = new ArrayList<>();
@@ -260,13 +290,13 @@ public final class ReportGenerator {
             return;
         }
         sb.append("## 击杀时间线（全部英雄击杀）\n\n");
-        sb.append("| 游戏时间 | 击杀者 | 被击杀 | 助攻 | 阵亡者身价 | 对方2秒金币/经验 | 阵亡后对方目标 |\n")
-          .append("|---|---|---|---|---|---|---|\n");
+        sb.append("| 游戏时间 | 击杀者 | 被击杀 | 位置 | 助攻 | 阵亡者身价 | 对方2秒金币/经验 | 阵亡后对方目标 |\n")
+          .append("|---|---|---|---|---|---|---|---|\n");
         for (JsonNode k : kills) {
             sb.append('|').append(gameTime(k.path("t").asDouble()))
               .append('|').append(heroShort(k.path("killer").asText("")))
               .append('|').append(heroShort(k.path("victim").asText("")))
-              .append('|');
+              .append('|').append(locationLabel(k)).append('|');
             JsonNode assist = k.path("assist_players");
             sb.append(assist.isArray() && !assist.isEmpty() ? assist.size() + " 人" : "-")
               .append('|');
@@ -279,6 +309,18 @@ public final class ReportGenerator {
         sb.append("阵亡者身价为阵亡瞬间净资产；对方2秒金币/经验为击杀方全队在阵亡后 2 秒内获得的金币与经验")
           .append("（含该窗口被动/补刀等其它收入，为击杀奖励的近似值）；阵亡后对方目标为阵亡后 20 秒内")
           .append("击杀方拿下的首个建筑或肉山（无则 '-'）。\n\n");
+    }
+
+    static String locationLabel(JsonNode event) {
+        JsonNode loc = event.path("location");
+        if (!loc.isArray() || loc.size() != 2) {
+            return "-";
+        }
+        String coordinates = "(" + fmt(loc.get(0).asDouble()) + "," + fmt(loc.get(1).asDouble()) + ")";
+        if (!"player_sample".equals(event.path("location_source").asText())) {
+            return coordinates;
+        }
+        return "约" + coordinates + "（阵亡前" + fmt(event.path("location_age_sec").asDouble()) + "s采样）";
     }
 
     static String deathFollowup(JsonNode co, double killT) {
@@ -381,12 +423,13 @@ public final class ReportGenerator {
             sb.append('\n');
         }
         if (hasBuilding) {
-            sb.append("**建筑摧毁**（最后摧毁遗迹即比赛结束）\n\n");
-            sb.append("| 时间 | 建筑 | 摧毁方 |\n|---|---|---|\n");
+            sb.append("**建筑事件**（同队完成最后一击时记为反补）\n\n");
+            sb.append("| 时间 | 建筑 | 结果 |\n|---|---|---|\n");
             for (JsonNode b : bld) {
                 sb.append('|').append(gameTime(b.path("t").asDouble()))
                   .append('|').append(buildingLabel(b.path("building").asText(b.path("building_key").asText())))
-                  .append('|').append(side(b.path("destroyer_team").asInt())).append("|\n");
+                  .append('|').append(side(b.path("destroyer_team").asInt()))
+                  .append(b.path("denied").asBoolean(false) ? "反补" : "摧毁").append("|\n");
             }
             sb.append('\n');
         }

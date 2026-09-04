@@ -12,6 +12,10 @@ final class MetricsDatabaseWriter {
             st.execute("ATTACH '" + escape(output) + "' AS out (TYPE duckdb)");
             st.execute("CREATE OR REPLACE TABLE out.combatlog AS SELECT * FROM combatlog_v");
             st.execute("CREATE OR REPLACE TABLE out.players AS SELECT * FROM players_v");
+            st.execute("CREATE OR REPLACE TABLE out.wards AS SELECT * FROM wards_v");
+            st.execute("CREATE OR REPLACE TABLE out.ward_lifetimes AS SELECT * FROM ward_lifetimes");
+            st.execute("CREATE OR REPLACE TABLE out.dewards AS SELECT * FROM dewards");
+            st.execute("CREATE OR REPLACE TABLE out.smoke_events AS SELECT * FROM smoke_events");
             st.execute("CREATE OR REPLACE TABLE out.kills AS SELECT * FROM hero_kills");
             st.execute("CREATE OR REPLACE TABLE out.hero_damage AS SELECT * FROM combatlog_v " +
                 "WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero");
@@ -27,13 +31,24 @@ final class MetricsDatabaseWriter {
             st.execute("CREATE OR REPLACE TABLE out.roshan_kills AS SELECT t, attacker, attacker_key, " +
                 "attacker_team FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target LIKE 'npc_dota_roshan%'");
             st.execute("CREATE OR REPLACE TABLE out.building_kills AS SELECT t, target, target_team, " +
-                "attacker_team FROM combatlog_v WHERE type='DOTA_COMBATLOG_TEAM_BUILDING_KILL'");
+                "attacker_team, (target_team IN (2, 3) AND target_team = attacker_team) AS denied " +
+                "FROM combatlog_v WHERE type='DOTA_COMBATLOG_TEAM_BUILDING_KILL'");
             st.execute("CREATE OR REPLACE TABLE out.farm_curves AS " + MetricQueries.farmCurvesSql());
             st.execute("CREATE OR REPLACE TABLE out.roster AS " + MetricQueries.rosterSql());
             st.execute("CREATE OR REPLACE TABLE out.lanes AS " + MetricQueries.lanePersistSql());
             st.execute("CREATE OR REPLACE TABLE out.death_costs AS " + MetricQueries.deathCostBatchSql());
             st.execute("CREATE OR REPLACE TABLE out.conceded_objectives AS " +
                 MetricQueries.concededObjectiveBatchSql());
+            st.execute("CREATE OR REPLACE TABLE out.death_incidents AS SELECT * FROM death_incidents");
+            st.execute("CREATE OR REPLACE TABLE out.incident_actions AS SELECT * FROM incident_actions");
+            st.execute("CREATE OR REPLACE TABLE out.incident_controls AS SELECT * FROM incident_controls");
+            st.execute("CREATE OR REPLACE TABLE out.incident_damage_sources AS SELECT * FROM incident_damage_sources");
+            st.execute("CREATE OR REPLACE TABLE out.incident_health_timeline AS SELECT * FROM incident_health_timeline");
+            st.execute("CREATE OR REPLACE TABLE out.incident_vitals AS SELECT * FROM incident_vitals");
+            st.execute("CREATE OR REPLACE TABLE out.incident_nearby_heroes AS SELECT * FROM incident_nearby_heroes");
+            st.execute("CREATE OR REPLACE TABLE out.incident_other_deaths AS SELECT * FROM incident_other_deaths");
+            st.execute("CREATE OR REPLACE TABLE out.incident_vision AS SELECT * FROM incident_vision");
+            st.execute("CREATE OR REPLACE TABLE out.incident_smoke_events AS SELECT * FROM incident_smoke_events");
         }
     }
 

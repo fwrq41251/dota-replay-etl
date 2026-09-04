@@ -15,6 +15,7 @@ import org.slf4j.LoggerFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -183,8 +184,8 @@ public final class Main {
         long t0 = System.currentTimeMillis();
         ReplayExtractor.Result result = ReplayExtractor.run(dem, out, sample);
         long elapsedMs = System.currentTimeMillis() - t0;
-        log.info("match {}: {} combat log entries, {} player samples, duration {}s in {}ms",
-            result.matchId(), result.combatLogCount(), result.playersCount(),
+        log.info("match {}: {} combat log entries, {} player samples, {} wards, duration {}s in {}ms",
+            result.matchId(), result.combatLogCount(), result.playersCount(), result.wardCount(),
             result.lastTick() / 30, elapsedMs);
         log.info("output: {}", result.dir().toAbsolutePath());
         return result.dir();
@@ -239,7 +240,8 @@ public final class Main {
 
     private static Map<String, String> options(String[] args, int start, Set<String> flags,
                                                String... allowedNames) {
-        Set<String> allowed = Set.of(allowedNames);
+        Set<String> allowed = new HashSet<>(Set.of(allowedNames));
+        allowed.addAll(flags);
         Map<String, String> values = new HashMap<>();
         for (int i = start; i < args.length; i++) {
             String name = args[i];
@@ -323,6 +325,7 @@ public final class Main {
             Output layout (per match):
               <out>/<matchId>/combatlog.ndjson   every combat log entry, one JSON object per line
               <out>/<matchId>/players.ndjson     per-second sampled player state (10 players)
+              <out>/<matchId>/wards.ndjson       observer/sentry ward lifecycles and removal evidence
               <out>/<matchId>/match.json         match-level facts
               <out>/<matchId>/metrics.json       computed metrics (via `metrics` command)
               <out>/<matchId>/metrics.duckdb     persisted tables for ad-hoc SQL

@@ -27,8 +27,8 @@ public final class ReplayExtractor {
     private static final Pattern MATCH_ID_IN_FILENAME = Pattern.compile("(\\d{6,})\\.dem");
     private static final int DOTA_TICK_RATE = 30;
 
-    public record Result(long matchId, Path dir, Path combatLog, Path players, Path match,
-                         long combatLogCount, long playersCount, int lastTick) {
+    public record Result(long matchId, Path dir, Path combatLog, Path players, Path wards, Path match,
+                         long combatLogCount, long playersCount, long wardCount, int lastTick) {
     }
 
     public static Result run(Path demFile, Path outDir, int sampleIntervalSec) throws Exception {
@@ -45,13 +45,16 @@ public final class ReplayExtractor {
 
         Path combatPath = dir.resolve("combatlog.ndjson");
         Path playersPath = dir.resolve("players.ndjson");
+        Path wardsPath = dir.resolve("wards.ndjson");
         Path matchPath = dir.resolve("match.json");
         Path combatTemp = AtomicFiles.createTempSibling(combatPath);
         Path playersTemp = AtomicFiles.createTempSibling(playersPath);
+        Path wardsTemp = AtomicFiles.createTempSibling(wardsPath);
         Path matchTemp = AtomicFiles.createTempSibling(matchPath);
 
         long combatCount;
         long playersCount;
+        long wardCount;
         int lastTick;
         float gameStartTime;
         float gameEndTime;
@@ -60,14 +63,17 @@ public final class ReplayExtractor {
         int direScore;
         try {
             try (NdjsonWriter combat = new NdjsonWriter(combatTemp);
-                 NdjsonWriter players = new NdjsonWriter(playersTemp)) {
-                ExtractionProcessor proc = new ExtractionProcessor(combat, players, sampleIntervalSec);
+                 NdjsonWriter players = new NdjsonWriter(playersTemp);
+                 NdjsonWriter wards = new NdjsonWriter(wardsTemp)) {
+                ExtractionProcessor proc = new ExtractionProcessor(combat, players, wards, sampleIntervalSec);
                 try (MappedFileSource source = new MappedFileSource(demFile.toString())) {
                     new SimpleRunner(source).runWith(proc);
                 }
+                proc.finishWardEvents();
                 lastTick = proc.lastTick();
                 combatCount = combat.count();
                 playersCount = players.count();
+                wardCount = wards.count();
                 gameStartTime = proc.gameStartTime();
                 gameEndTime = proc.gameEndTime();
                 gameWinner = proc.gameWinner();
@@ -83,24 +89,27 @@ public final class ReplayExtractor {
                 }
             }
             writeMatchJson(matchTemp, matchId, demFile, replaySha256, header, sampleIntervalSec, lastTick,
-                combatCount, playersCount, gameStartTime, gameEndTime, gameWinner,
+                combatCount, playersCount, wardCount, gameStartTime, gameEndTime, gameWinner,
                 radiantScore, direScore);
             AtomicFiles.replace(combatTemp, combatPath);
             AtomicFiles.replace(playersTemp, playersPath);
+            AtomicFiles.replace(wardsTemp, wardsPath);
             AtomicFiles.replace(matchTemp, matchPath);
             invalidateDerivedOutputs(dir);
         } finally {
             Files.deleteIfExists(combatTemp);
             Files.deleteIfExists(playersTemp);
+            Files.deleteIfExists(wardsTemp);
             Files.deleteIfExists(matchTemp);
         }
-        return new Result(matchId, dir, combatPath, playersPath, matchPath, combatCount, playersCount, lastTick);
+        return new Result(matchId, dir, combatPath, playersPath, wardsPath, matchPath,
+            combatCount, playersCount, wardCount, lastTick);
     }
 
     private static void writeMatchJson(Path path, long matchId, Path demFile, String replaySha256,
                                        Demo.CDemoFileHeader header,
                                        int sampleIntervalSec, int lastTick,
-                                       long combatCount, long playersCount,
+                                       long combatCount, long playersCount, long wardCount,
                                        float gameStartTime, float gameEndTime, int gameWinner,
                                        int radiantScore, int direScore) throws Exception {
         ObjectNode root = MAPPER.createObjectNode();
@@ -120,6 +129,7 @@ public final class ReplayExtractor {
         root.put("sample_interval_sec", sampleIntervalSec);
         root.put("combat_log_entries", combatCount);
         root.put("player_samples", playersCount);
+        root.put("ward_lifecycles", wardCount);
         if (gameStartTime > 0) {
             root.put("game_start_time_raw", round1(gameStartTime));
         }
