@@ -24,6 +24,8 @@ class PlayerReviewGeneratorTest {
         metrics.putArray("local_fights");
         metrics.putArray("local_fight_events");
         metrics.putArray("local_fight_players");
+        for (String section : java.util.List.of("equipment_samples", "equipment_changes",
+            "equipment_first_observations", "equipment_windows", "equipment_uses")) metrics.putArray(section);
 
         ObjectNode summary = metrics.putObject("summary");
         summary.put("duration_sec", 300.0);

@@ -15,6 +15,29 @@ import java.sql.DriverManager;
 import static org.junit.jupiter.api.Assertions.*;
 
 class LocalFightBuilderTest {
+    @ParameterizedTest
+    @ValueSource(strings={"future","missing","NaN","age"})
+    void memberPositionsUseActualClockForBothBodiesAndBlockInvalidLatest(String scenario) throws Exception {
+        sample("a",2,8,100); sample("b",3,8,100);
+        sample("a",2,10,100); sample("b",3,10,100);
+        conn.createStatement().execute("UPDATE players_v SET equipment=json_object('observed_raw_t',t)");
+        String observed=switch(scenario) {case "missing" -> "null";case "NaN" -> "\"NaN\"";default -> "12";};
+        conn.createStatement().execute("UPDATE players_v SET equipment='{\"observed_raw_t\":"+observed+"}' WHERE t=10");
+        event(scenario.equals("future")?11:13,"a","b","roster_team_match",null);
+        var e=run().path("local_fight_events").get(0);
+        if(scenario.equals("age")) {
+            assertEquals(12,e.path("sample_t").asDouble());
+            assertEquals(12,e.path("attacker_sample_t").asDouble());
+            assertEquals(1,e.path("location_age_sec").asDouble());
+            assertEquals(1,e.path("attacker_location_age_sec").asDouble());
+        } else if(scenario.equals("future")) {
+            assertEquals(8,e.path("sample_t").asDouble()); // older genuine observation, never the future position
+        } else {
+            assertTrue(e.path("sample_t").isNull());
+            assertTrue(e.path("attacker_presence_key").isNull());
+            assertTrue(e.path("fight_id").isNull());
+        }
+    }
     private Connection conn;
     private long id;
 
@@ -25,7 +48,7 @@ class LocalFightBuilderTest {
             CREATE TABLE combatlog_v(event_id BIGINT,t DOUBLE,raw_t DOUBLE,type VARCHAR,value DOUBLE,
               attacker VARCHAR,target VARCHAR,credited_attacker_key VARCHAR,attribution_source VARCHAR,
               target_player_key VARCHAR,attacker_team INT,target_team INT,attacker_hero BOOLEAN);
-            CREATE TABLE players_v(t DOUBLE,tick INT,player INT,hero_key VARCHAR,team INT,x DOUBLE,y DOUBLE,hp INT);
+            CREATE TABLE players_v(t DOUBLE,tick INT,player INT,hero_key VARCHAR,team INT,x DOUBLE,y DOUBLE,hp INT,equipment JSON);
             CREATE TABLE hero_death_events(event_id BIGINT,kill_id BIGINT,death_class VARCHAR);
             CREATE TABLE hero_team AS SELECT * FROM (VALUES ('a',2),('b',3),('c',2),('d',3),('owner',2)) h(hero_key,team);
             """);
@@ -35,9 +58,9 @@ class LocalFightBuilderTest {
     void close() throws Exception { conn.close(); }
 
     private void sample(String hero, int team, double t, double x) throws Exception {
-        try (var st = conn.prepareStatement("INSERT INTO players_v VALUES (?, ?, 0, ?, ?, ?, 100, 100)")) {
+        try (var st = conn.prepareStatement("INSERT INTO players_v VALUES (?, ?, 0, ?, ?, ?, 100, 100,?::JSON)")) {
             st.setDouble(1,t); st.setInt(2,(int)(t*30)); st.setString(3,hero);
-            st.setInt(4,team); st.setDouble(5,x); st.execute();
+            st.setInt(4,team); st.setDouble(5,x); st.setString(6,"{\"observed_raw_t\":"+t+"}"); st.execute();
         }
     }
 
@@ -63,7 +86,7 @@ class LocalFightBuilderTest {
 
     private ObjectNode run() throws Exception {
         ObjectNode root = new ObjectMapper().createObjectNode();
-        new LocalFightBuilder(conn).addTo(root);
+        new LocalFightBuilder(conn).addTo(root,0);
         return root;
     }
 

@@ -33,6 +33,9 @@ final class MetricsDatabaseWriter {
             st.execute("CREATE OR REPLACE TABLE out.local_fights AS SELECT * FROM local_fights");
             st.execute("CREATE OR REPLACE TABLE out.local_fight_events AS SELECT * FROM local_fight_events");
             st.execute("CREATE OR REPLACE TABLE out.local_fight_players AS SELECT * FROM local_fight_players");
+            for (String table : EquipmentBuilder.TABLES) {
+                st.execute("CREATE OR REPLACE TABLE out." + table + " AS SELECT * FROM " + table);
+            }
             st.execute("CREATE OR REPLACE TABLE out.teamfight_economy AS SELECT * FROM tf_economy");
             st.execute("CREATE OR REPLACE TABLE out.roshan_kills AS SELECT t, attacker, attacker_key, " +
                 "attacker_team FROM combatlog_v WHERE type='DOTA_COMBATLOG_DEATH' AND target LIKE 'npc_dota_roshan%'");

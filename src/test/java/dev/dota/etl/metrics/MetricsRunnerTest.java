@@ -65,7 +65,14 @@ class MetricsRunnerTest {
             "{\"t\":100.0,\"tick\":3000,\"player\":0,\"team\":2,\"name\":\"alice\",\"hero\":\"Pudge\",\"level\":5,\"kills\":2,\"deaths\":1,\"assists\":3,\"x\":100.0,\"y\":100.0,\"z\":64.0,\"hp\":1000.0,\"max_hp\":1000.0,\"total_earned_gold\":1200,\"last_hits\":15,\"denies\":2}",
             "{\"t\":100.0,\"tick\":3000,\"player\":1,\"team\":3,\"name\":\"bob\",\"hero\":\"Axe\",\"level\":4,\"kills\":1,\"deaths\":2,\"assists\":1,\"x\":-100.0,\"y\":-100.0,\"z\":64.0,\"hp\":900.0,\"max_hp\":900.0,\"total_earned_gold\":1100,\"last_hits\":12,\"denies\":1}"
         );
-        Files.write(players, playerRows);
+        // This fixture models observations exactly at the event-clock sample labels.
+        List<String> observedRows = new ArrayList<>();
+        for (String row : playerRows) {
+            ObjectNode p = (ObjectNode) MAPPER.readTree(row);
+            if (p.has("hero")) p.putObject("equipment").put("observed_raw_t", p.path("t").asDouble());
+            observedRows.add(p.toString());
+        }
+        Files.write(players, observedRows);
         Files.writeString(dir.resolve("wards.ndjson"),
             "{\"ward_id\":\"w1\",\"type\":\"observer\",\"placed_t\":90.0,\"removed_t\":150.0," +
             "\"lifetime_sec\":60.0,\"team\":2,\"player_owner_id\":0,\"player\":0," +
@@ -169,6 +176,53 @@ class MetricsRunnerTest {
         for (JsonNode event : m.path("hero_death_events")) {
             if (event.path("t").asDouble() == 130)
                 assertEquals("scored_death", event.path("death_class").asText());
+        }
+    }
+
+    @Test
+    void equipmentDeliveryIsObservedAfterRepeatedPurchasesAndPersistsLosslessly() throws Exception {
+        runMetrics();
+        Path players = dir.resolve("players.ndjson");
+        List<String> rows = new ArrayList<>(Files.readAllLines(players));
+        ObjectNode base = (ObjectNode) MAPPER.readTree(rows.get(2));
+        for (int t : new int[]{104,107,109,110}) {
+            ObjectNode p = base.deepCopy().put("t",t).put("tick",t*30);
+            ObjectNode e = p.putObject("equipment").put("observed_raw_t",t).put("slot_count",25)
+                .put("status","complete").put("source","selected_hero.m_hItems/EntityNames")
+                .put("clock_source","tick_end_latest_combatlog");
+            var slots=e.putArray("slots");
+            for(int slot=0;slot<25;slot++) {
+                var s=slots.addObject().put("slot",slot)
+                    .put("region",dev.dota.etl.extract.ExtractionProcessor.equipmentRegion(slot,10836));
+                if(t!=104 && slot==(t==107?9:t==109?6:0))
+                    s.put("status","occupied").put("entity_uid",123).put("item","item_blinkdagger");
+                else s.put("status","empty").putNull("entity_uid").putNull("item");
+            }
+            rows.add(p.toString());
+        }
+        Files.write(players,rows);
+        Files.writeString(dir.resolve("match.json"),"{\"schema_version\":4,\"build_num\":10836,\"game_start_time_raw\":100}");
+        ObjectNode m = new MetricsRunner(dir.resolve("combatlog.ndjson"),players).run();
+        assertEquals(2,m.path("item_timeline").get(0).path("items").size());
+        assertEquals(5,m.path("item_timeline").get(0).path("items").get(0).path("t").asDouble());
+        assertEquals(6,m.path("item_timeline").get(0).path("items").get(1).path("t").asDouble());
+        for(var f:m.path("equipment_first_observations")) {
+            assertEquals(switch(f.path("observation").asText()) {
+                case "inventory" -> 7.0; case "carried" -> 9.0; default -> 10.0;
+            },f.path("sample_t").asDouble());
+        }
+        assertEquals(3,m.path("equipment_first_observations").size());
+        try(var conn=DriverManager.getConnection("jdbc:duckdb:"+dir.resolve("metrics.duckdb"))) {
+            for(String table:EquipmentBuilder.TABLES) {
+                var array=MAPPER.createArrayNode();
+                try(var st=conn.createStatement();var rs=st.executeQuery("SELECT to_json(r) FROM (SELECT * FROM "+table+" ORDER BY ALL) r")) {
+                    while(rs.next()) array.add(MAPPER.readTree(rs.getString(1)));
+                }
+                assertEquals(m.path(table),array,table);
+            }
+            try(var rs=conn.createStatement().executeQuery("SELECT count(*) FROM item_timeline")) {
+                rs.next(); assertEquals(2,rs.getInt(1));
+            }
         }
     }
 
@@ -288,7 +342,7 @@ class MetricsRunnerTest {
     @Test
     void computesSummary() throws Exception {
         ObjectNode m = runMetrics();
-        assertEquals(15, m.path("schema_version").asInt());
+        assertEquals(16, m.path("schema_version").asInt());
         assertEquals(5, m.path("parameters").path("teamfight_bucket_sec").asInt());
         com.fasterxml.jackson.databind.JsonNode s = m.path("summary");
         assertEquals(2, s.path("team_kills").size());
@@ -633,6 +687,14 @@ class MetricsRunnerTest {
                 }
             }
             assertEquals(m.path("teamfights").size(), teamfights);
+            for (String table : EquipmentBuilder.TABLES) {
+                var rows = MAPPER.createArrayNode();
+                try (var rs = conn.createStatement().executeQuery(
+                    "SELECT to_json(r) FROM (SELECT * FROM " + table + " ORDER BY ALL) r")) {
+                    while (rs.next()) rows.add(MAPPER.readTree(rs.getString(1)));
+                }
+                assertEquals(m.path(table), rows, "equipment persisted fields " + table);
+            }
             for (String table : List.of("local_fights", "local_fight_events", "local_fight_players")) {
                 String order = table.equals("local_fights") ? "id"
                     : table.equals("local_fight_events") ? "t,event_id" : "fight_id,hero_key";

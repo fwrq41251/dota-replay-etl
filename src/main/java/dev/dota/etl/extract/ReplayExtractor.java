@@ -65,7 +65,7 @@ public final class ReplayExtractor {
             try (NdjsonWriter combat = new NdjsonWriter(combatTemp);
                  NdjsonWriter players = new NdjsonWriter(playersTemp);
                  NdjsonWriter wards = new NdjsonWriter(wardsTemp)) {
-                ExtractionProcessor proc = new ExtractionProcessor(combat, players, wards, sampleIntervalSec);
+                ExtractionProcessor proc = new ExtractionProcessor(combat, players, wards, sampleIntervalSec, header.getBuildNum());
                 try (MappedFileSource source = new MappedFileSource(demFile.toString())) {
                     new SimpleRunner(source).runWith(proc);
                 }

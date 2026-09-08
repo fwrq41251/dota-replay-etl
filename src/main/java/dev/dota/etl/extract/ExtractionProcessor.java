@@ -20,6 +20,8 @@ import skadistats.clarity.processor.reader.OnTickEnd;
 import skadistats.clarity.processor.runner.Context;
 import skadistats.clarity.processor.sendtables.DTClasses;
 import skadistats.clarity.processor.sendtables.OnDTClassesComplete;
+import skadistats.clarity.processor.stringtables.StringTables;
+import skadistats.clarity.processor.stringtables.UsesStringTable;
 import skadistats.clarity.wire.dota.common.proto.DOTACombatLog;
 
 import java.util.ArrayList;
@@ -53,11 +55,14 @@ import java.util.Objects;
  * seen game time is a reliable clock.
  */
 @UsesEntities
+@UsesStringTable("EntityNames")
 public class ExtractionProcessor {
 
     private static final String[] HERO_PREFIX_S2 = {"CDOTA_Unit_Hero_"};
     private static final String[] HERO_PREFIX_S1 = {"DT_DOTA_Unit_Hero_"};
-    private static final int ITEM_SLOTS = 12;
+    @Insert
+    private StringTables stringTables;
+    private final int replayBuild;
 
     @Insert
     private Context ctx;
@@ -97,11 +102,12 @@ public class ExtractionProcessor {
     private final List<WardDeathEvidence> wardDeaths = new ArrayList<>();
 
     public ExtractionProcessor(NdjsonWriter combatLogWriter, NdjsonWriter playersWriter,
-                               NdjsonWriter wardsWriter, int sampleIntervalSec) {
+                               NdjsonWriter wardsWriter, int sampleIntervalSec, int replayBuild) {
         this.combatLogWriter = combatLogWriter;
         this.playersWriter = playersWriter;
         this.wardsWriter = wardsWriter;
         this.sampleIntervalSec = Math.max(1, sampleIntervalSec);
+        this.replayBuild = replayBuild;
     }
 
     @OnEntityCreated(classPattern = "CDOTA_NPC_Observer_Ward(_TrueSight)?")
@@ -385,16 +391,8 @@ public class ExtractionProcessor {
                 put(rec, "mana", floatOrNull(hero, lookup.fpMana));
                 put(rec, "max_mana", floatOrNull(hero, lookup.fpMaxMana));
 
-                String[] items = lookup.items();
-                if (items != null) {
-                    ObjectNode itemArr = rec.putObject("items");
-                    for (int slot = 0; slot < items.length; slot++) {
-                        if (items[slot] != null) {
-                            itemArr.put("slot" + slot, items[slot]);
-                        }
-                    }
-                }
             }
+            lookup.writeEquipment(rec);
             playersWriter.write(rec);
         }
     }
@@ -693,7 +691,6 @@ public class ExtractionProcessor {
         private DTClass heroClass;
         private FieldPath fpCellX, fpCellY, fpCellZ, fpVecX, fpVecY, fpVecZ;
         private FieldPath fpHp, fpMaxHp, fpMana, fpMaxMana;
-        private final FieldPath[] itemPaths = new FieldPath[ITEM_SLOTS];
         private String cachedHeroName;
 
         PlayerLookup(DTClass prClass, int idx, boolean legacy) {
@@ -740,9 +737,6 @@ public class ExtractionProcessor {
             fpMaxHp = fp(heroClass, "m_iMaxHealth");
             fpMana = fp(heroClass, "m_flMana");
             fpMaxMana = fp(heroClass, "m_flMaxMana");
-            for (int j = 0; j < itemPaths.length; j++) {
-                itemPaths[j] = fp(heroClass, "m_hItems." + Util.arrayIdxToString(j));
-            }
             cachedHeroName = heroNameFromClass(heroClass.getDtName());
         }
 
@@ -774,42 +768,87 @@ public class ExtractionProcessor {
             return cachedHeroName;
         }
 
-        String[] items() {
-            if (heroEntity == null) {
-                return null;
+        void writeEquipment(ObjectNode rec) {
+            ObjectNode equipment = rec.putObject("equipment");
+            // This is the observed tick's combat clock, not the older scheduled sample label.
+            equipment.put("observed_raw_t", currentGameTime);
+            equipment.put("source", "selected_hero.m_hItems/EntityNames");
+            equipment.put("clock_source", "tick_end_latest_combatlog");
+            equipment.put("status", "missing");
+            var slots = equipment.putArray("slots");
+            Integer selected = intOrNull(playerResourceEntity, selectedHeroPath);
+            if (heroEntity == null || !heroEntity.isActive() || selected == null
+                || selected != heroEntity.getHandle()) return;
+            Integer count = propertyInt(heroEntity, "m_hItems");
+            if (count == null || count < 1 || count > 128) return;
+            equipment.put("hero_handle", selected);
+            equipment.put("slot_count", count);
+            ObjectNode names = rec.putObject("items");
+            boolean complete = true;
+            for (int slot = 0; slot < count; slot++) {
+                ObjectNode state = slots.addObject();
+                state.put("slot", slot);
+                state.put("region", equipmentRegion(slot, replayBuild));
+                Integer handle = propertyInt(heroEntity, "m_hItems." + Util.arrayIdxToString(slot));
+                putNullable(state, "handle", handle);
+                state.put("status", "unknown");
+                state.putNull("item");
+                state.putNull("entity_uid");
+                if (s2 && handle != null && handle == 0xFFFFFF) {
+                    state.put("status", "empty");
+                    continue;
+                }
+                Entity item = handle == null ? null : entities.getByHandle(handle);
+                if (item != null && item.isActive()) {
+                    state.put("entity_uid", item.getUid());
+                    state.put("dt_class", item.getDtClass().getDtName());
+                    Integer index = propertyInt(item, "m_pEntity.m_nameStringTableIndex");
+                    var table = stringTables.forName("EntityNames");
+                    String name = canonicalItemName(table, index);
+                    if (name != null) {
+                        state.put("item", name);
+                        state.put("name_index", index);
+                        state.put("status", "occupied");
+                        writeItemCounters(state, name, replayBuild,
+                            propertyFloat(item, "m_fCooldown"), propertyInt(item, "m_iCurrentCharges"));
+                        names.put("slot" + slot, name);
+                        continue;
+                    }
+                }
+                complete = false;
             }
-            String[] out = new String[itemPaths.length];
-            for (int j = 0; j < itemPaths.length; j++) {
-                FieldPath fp = itemPaths[j];
-                if (fp == null) {
-                    continue;
-                }
-                Integer handle = intOrNull(heroEntity, fp);
-                if (handle == null || handle <= 0) {
-                    continue;
-                }
-                Entity item = entities.getByHandle(handle);
-                if (item == null) {
-                    continue;
-                }
-                out[j] = itemName(item);
-            }
-            return out;
+            equipment.put("status", complete ? "complete" : "partial");
         }
+    }
 
-        private String itemName(Entity item) {
-            String dt = item.getDtClass().getDtName();
-            if (dt.equals("CDOTA_Item") || dt.equals("DT_DOTA_Item")) {
-                return null;
-            }
-            if (dt.startsWith("CDOTA_Item_")) {
-                return "item_" + dt.substring("CDOTA_Item_".length()).toLowerCase();
-            }
-            if (dt.startsWith("DT_DOTA_Item_")) {
-                return "item_" + dt.substring("DT_DOTA_Item_".length()).toLowerCase();
-            }
-            return dt;
-        }
+    /** Only the replay layout audited in README is classified; other builds remain unknown. */
+    public static String equipmentRegion(int slot, int build) {
+        if (build != 10836 || slot < 0) return "unknown";
+        if (slot < 6) return "main";
+        if (slot < 9) return "backpack";
+        if (slot < 15) return "stash";
+        return switch (slot) {
+            case 15 -> "teleport";
+            case 16 -> "neutral";
+            case 17 -> "neutral_enhancement";
+            default -> "unknown";
+        };
+    }
+
+    /** EntityNames is authoritative even for generic CDOTA_Item; DT class spelling is not an item ID. */
+    static String canonicalItemName(skadistats.clarity.model.StringTable table, Integer index) {
+        if (table == null || index == null || !table.hasIndex(index)) return null;
+        String name = table.getNameByIndex(index);
+        return name != null && name.startsWith("item_") ? name : null;
+    }
+
+    /** Snapshot counters only for the items/build whose time evolution was checked, never a usable flag. */
+    static void writeItemCounters(ObjectNode state, String name, int build, Float cooldown, Integer charges) {
+        state.putNull("cooldown_remaining_sec");
+        state.putNull("item_charges");
+        if (build != 10836 || !("item_black_king_bar".equals(name) || "item_magic_wand".equals(name))) return;
+        if (cooldown != null && Float.isFinite(cooldown) && cooldown >= 0) state.put("cooldown_remaining_sec", cooldown);
+        if (charges != null && charges >= 0) state.put("item_charges", charges);
     }
 
     private static final class DataLookup {

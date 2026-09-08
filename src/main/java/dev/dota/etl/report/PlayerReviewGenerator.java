@@ -77,6 +77,7 @@ public final class PlayerReviewGenerator {
         ReportGenerator.appendFactScope(sb, metrics);
         appendVision(sb, metrics, target, heroKey);
         appendItems(sb, metrics, heroKey);
+        EquipmentReport.appendFirstObservations(sb, metrics, heroKey);
         appendKillsDeaths(sb, metrics, heroKey);
         appendDeathWindows(sb, metrics, heroKey);
         appendEconomy(sb, metrics, heroKey);
@@ -246,13 +247,13 @@ public final class PlayerReviewGenerator {
     private void appendDeathWindows(StringBuilder sb, JsonNode metrics, String heroKey) throws Exception {
         JsonNode incidents = metrics.path("incidents").path("deaths");
         if (incidents.isArray()) {
-            appendStructuredDeathWindows(sb, incidents, heroKey);
+            appendStructuredDeathWindows(sb, metrics, incidents, heroKey);
             return;
         }
         appendLegacyDeathWindows(sb, metrics, heroKey);
     }
 
-    private void appendStructuredDeathWindows(StringBuilder sb, JsonNode incidents, String heroKey) {
+    private void appendStructuredDeathWindows(StringBuilder sb, JsonNode metrics, JsonNode incidents, String heroKey) {
         List<JsonNode> deaths = new ArrayList<>();
         for (JsonNode incident : incidents) {
             if (heroKey.equals(incident.path("victim_key").asText())) {
@@ -351,7 +352,9 @@ public final class PlayerReviewGenerator {
               .append(death.has("last_bkb_use_age_sec")
                   ? ReportGenerator.fmt(death.path("last_bkb_use_age_sec").asDouble()) + " 秒前"
                   : "此前无记录")
-              .append("\n\n");
+               .append("\n\n");
+            sb.append("- 死亡前装备证据：").append(EquipmentReport.window(metrics, "death",
+                death.path("kill_id").asLong(), heroKey)).append("\n\n");
         }
     }
 

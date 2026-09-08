@@ -120,6 +120,7 @@ final class DeathIncidentBuilder {
                   ON c.credited_attacker_key = k.target_key
                  AND c.t >= k.t - {} AND c.t <= k.t
                 WHERE c.type IN ('DOTA_COMBATLOG_ABILITY', 'DOTA_COMBATLOG_ITEM')
+                  AND c.attribution_source IN ('roster_team_match','hero_action_identity') AND c.attacker_hero
                   AND COALESCE({}, '') NOT LIKE '%power_treads%'
                 ORDER BY k.kill_id, c.t
                 """, inflictor, DEATH_INCIDENT_BEFORE_SEC, inflictor));
@@ -179,6 +180,7 @@ final class DeathIncidentBuilder {
                 LEFT JOIN combatlog_v c ON c.t <= k.t AND (
                   (c.target_player_key = k.target_key AND c.type='DOTA_COMBATLOG_DAMAGE' AND c.t >= k.t - {})
                   OR (c.credited_attacker_key = k.target_key AND c.type='DOTA_COMBATLOG_ITEM'
+                    AND c.attribution_source IN ('roster_team_match','hero_action_identity') AND c.attacker_hero
                     AND lower(COALESCE({}, '')) LIKE '%black_king_bar%'))
                 GROUP BY k.kill_id, k.t
                 """, health, health, inflictor, DEATH_INCIDENT_BEFORE_SEC, inflictor));

@@ -158,13 +158,14 @@ public final class MetricsRunner {
                 addKills(conn, metrics);
                 new DeathIncidentBuilder(conn).addTo(metrics);
                 addTeamfights(conn, metrics);
-                new LocalFightBuilder(conn).addTo(metrics);
+                new LocalFightBuilder(conn).addTo(metrics, timeOffset);
                 addObjectives(conn, metrics);
                 addFarmCurves(conn, metrics);
                 addGoldCurves(conn, metrics);
                 addXpCurves(conn, metrics);
                 addItemTimeline(conn, metrics);
                 addDamage(conn, metrics);
+                new EquipmentBuilder(conn).addTo(metrics, timeOffset, match.path("build_num").asInt(-1));
                 MetricsDatabaseWriter.persist(conn, dbTemp);
             }
             AtomicFiles.replace(dbTemp, dbFile());

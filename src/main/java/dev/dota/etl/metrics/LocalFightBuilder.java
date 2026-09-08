@@ -20,10 +20,12 @@ final class LocalFightBuilder {
         this.conn = conn;
     }
 
-    void addTo(ObjectNode root) throws Exception {
+    void addTo(ObjectNode root, double timeOffset) throws Exception {
+        PlayerObservationClock.createView(conn, timeOffset);
         ObjectNode parameters = root.withObject("/parameters").putObject("local_fights");
         parameters.put("max_gap_sec", MAX_GAP).put("max_duration_sec", MAX_DURATION)
             .put("max_pair_distance", MAX_DISTANCE).put("max_sample_age_sec", MAX_SAMPLE_AGE);
+        parameters.put("position_clock", "equipment.observed_raw_t_minus_horn");
         root.withObject("/semantics").put("local_fights",
             "bounded_target_location_interactions; presence_requires_real_identity_and_local_position; economy_unknown");
         // Combat-log location fields have no general target-position contract. Use only real-target
@@ -35,37 +37,41 @@ final class LocalFightBuilder {
                    c.attacker AS attacker_unit, c.target AS target_unit,
                    c.credited_attacker_key, c.attribution_source, c.target_player_key,
                    c.attacker_team, c.target_team, d.kill_id, d.death_class,
-                   p.x, p.y, p.t sample_t, c.t-p.t location_age_sec,
-                   CASE WHEN p.t IS NULL THEN 'unknown' ELSE 'target_player_asof' END location_source,
+                    p.x, p.y, p.t sample_t, c.t-p.t location_age_sec,
+                    p.tick sample_tick,
+                    CASE WHEN p.t IS NULL THEN 'unknown' ELSE 'target_player_observed_asof' END location_source,
                    CASE WHEN p.t IS NULL THEN 'missing_or_stale_real_target_position'
                         ELSE 'located' END location_status,
                    CASE WHEN p.t IS NOT NULL THEN c.target_player_key END target_presence_key,
                    CASE WHEN c.attribution_source='roster_team_match' AND p.t IS NOT NULL
                           AND a.t IS NOT NULL AND sqrt(pow(a.x-p.x,2)+pow(a.y-p.y,2))<={}
                         THEN c.credited_attacker_key END attacker_presence_key,
-                   a.t attacker_sample_t, c.t-a.t attacker_location_age_sec,
+                    a.t attacker_sample_t, c.t-a.t attacker_location_age_sec,
+                    a.tick attacker_sample_tick,
                    a.x attacker_x, a.y attacker_y
             FROM combatlog_v c
             LEFT JOIN hero_death_events d ON d.event_id=c.event_id
             LEFT JOIN LATERAL (
               SELECT * FROM (
-                SELECT t,x,y,hp FROM players_v p
+                SELECT t,tick,x,y,hp FROM players_observed p
                 WHERE p.hero_key=c.target_player_key AND p.team=c.target_team
-                  AND p.t<=c.t AND c.t-p.t<={}
-                ORDER BY p.t DESC,p.tick DESC,p.player,p.x,p.y LIMIT 1
-              ) latest
-              WHERE isfinite(x) AND isfinite(y) AND NOT (x=0 AND y=0)
+                   AND p.asof_t<=c.t
+                ORDER BY p.tick DESC,p.scheduled_t DESC,p.player,p.x,p.y LIMIT 1
+               ) latest
+              WHERE t IS NOT NULL AND c.t-t BETWEEN 0 AND {}
+                AND isfinite(x) AND isfinite(y) AND NOT (x=0 AND y=0)
                 AND (hp>0 OR c.type='DOTA_COMBATLOG_DEATH')
             ) p ON true
             LEFT JOIN LATERAL (
               SELECT * FROM (
-                SELECT t,x,y,hp FROM players_v a
+                SELECT t,tick,x,y,hp FROM players_observed a
                 WHERE c.attribution_source='roster_team_match'
                   AND a.hero_key=c.credited_attacker_key AND a.team=c.attacker_team
-                  AND a.t<=c.t AND c.t-a.t<={}
-                ORDER BY a.t DESC,a.tick DESC,a.player,a.x,a.y LIMIT 1
-              ) latest
-              WHERE hp>0 AND isfinite(x) AND isfinite(y) AND NOT (x=0 AND y=0)
+                   AND a.asof_t<=c.t
+                ORDER BY a.tick DESC,a.scheduled_t DESC,a.player,a.x,a.y LIMIT 1
+               ) latest
+              WHERE t IS NOT NULL AND c.t-t BETWEEN 0 AND {}
+                AND hp>0 AND isfinite(x) AND isfinite(y) AND NOT (x=0 AND y=0)
             ) a ON true
             WHERE (c.type='DOTA_COMBATLOG_DAMAGE' AND c.attacker_hero AND c.target_player_key IS NOT NULL
                      AND c.value>0 AND c.attacker_team<>c.target_team)

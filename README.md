@@ -90,7 +90,7 @@ and prompts for that match.
 ```json
 {
   "match_id": 6676393091,
-  "schema_version": 3,
+  "schema_version": 4,
   "etl_version": "0.1.0-SNAPSHOT",
   "source_replay_sha256": "...",
   "map_name": "start",
@@ -133,7 +133,7 @@ One row per player per sample:
   "level": 1, "kills": 0, "deaths": 0, "assists": 0,
   "x": -6611.0, "y": -6503.6, "z": 384.0,
   "hp": 640.0, "max_hp": 640.0, "mana": 278.9, "max_mana": 278.9,
-  "items": { "slot0": "item_quellingblade", "slot3": "item_tango" }
+  "items": { "slot0": "item_quelling_blade", "slot3": "item_tango" }
 }
 ```
 
@@ -144,7 +144,22 @@ One row per player per sample:
 - Coordinates are world units; Source 2 stores positions as `(cell, vec)` pairs and the
   conversion applied is `(cell - 128) * 128 + vec` (world origin sits at cell 128).
   Verified against combat-log locations (radiant fountain reads ≈ `(-6700, -6700)`).
-- `items.slot0..5` main inventory, `6..8` backpack, `9` neutral slot; empty slots are omitted.
+- `items` is a convenience map of resolved canonical names, not completeness evidence. Schema 4
+  resolves names through `m_pEntity.m_nameStringTableIndex` into `EntityNames`, not DTClass lowercase.
+- `equipment` is the authoritative sampled inventory package: `observed_raw_t`, `source`,
+  `clock_source`, `status` (`complete`/`partial`/`missing`), selected `hero_handle`, `slot_count`,
+  and one `slots` entry per actual `m_hItems` array element. Each slot retains `slot`, `region`,
+  raw `handle`, `entity_uid`, canonical `item`, `dt_class`/`name_index` when resolved, and
+  `status` (`empty`/`occupied`/`unknown`). Missing handles/entities/names are not empty slots.
+- Equipment is read only from the current PlayerResource-selected active hero entity, never by
+  searching same-name heroes/illusions. `observed_raw_t` is the latest combat-log clock at the
+  observation tick, **not** the older scheduled row `t`. The existing player row schedule is retained
+  for other metrics; no equipment state is backdated to that schedule. It is still a tick-end
+  observation clock, not sub-tick event ordering or an exact delivery timestamp.
+- The audited build 10836 has **25** elements, slots **0..24**, not 12: `0..5` main, `6..8`
+  backpack, `9..14` stash, `15` teleport, `16` neutral, `17` neutral_enhancement. `18..24` have
+  unknown semantics. Other builds retain raw indices/names but all regions stay `unknown` until
+  their layouts are audited. The old documentation's `slot9 = neutral` was incorrect.
 
 ### wards.ndjson
 
@@ -157,10 +172,179 @@ game timestamps in this extraction stream and are normalized to horn-relative ti
 
 ## Metrics
 
+### Schema 16 Equipment Evidence
+
+Equipment is evidence about potential power windows, **not a computed combat-strength score**.
+Purchasing, observing inventory, carrying, entering the main inventory and being able to operate
+an item are separate facts. CLI options have not changed.
+
+#### Position Clock Correction
+
+Recompute `metrics`, `report` and `player-review` for schema-4 extraction after this correction;
+no replay re-extraction is needed. Earlier schema-16 metrics used the scheduled player `t` for
+local ITEM positions and member-event locations, even though the coordinates came from tick-end
+`equipment.observed_raw_t`. That could attach future coordinates and understate sample age.
+
+`PlayerObservationClock` now supplies both local member locations (target and attacker presence)
+and equipment-use positions with `observed_raw_t - game_start_time_raw`. As-of eligibility, output
+sample time and age all use this actual clock. Scheduled labels are used **only** to locate
+unknown-clock blockers; selection is ordered by replay tick before validating clock, identity,
+HP and coordinates. Missing/nonfinite clocks never become positions or get filtered out before
+latest-row selection. A known future observation is excluded; an older genuine as-of observation
+may still be used if fresh enough. Equipment windows use the same raw-clock normalization.
+The shared clock does not require complete inventory contents to establish a position timestamp.
+
+Local events retain `sample_tick` and `attacker_sample_tick`; uses retain `position_tick` and
+`position_clock_source`. Limits remain 5 seconds inclusive. A missing actual clock in older
+extraction now leaves local interactions unlocated and local equipment-use attribution unknown,
+instead of treating a planned label as observed evidence. Other global metrics/death classification
+have not been rewritten by this correction. Local membership and IDs may change: regenerate all
+derived artifacts together, rather than joining IDs from before and after recomputation.
+
+Independent audit on `8987316716`: future local-use positions **22 -> 0** (old maximum lead
+`0.200010` seconds); local uses **360 -> 359**, death uses unchanged at **102**, total uses
+**462 -> 461**. Of those 22 formerly future-backed events, 21 retain a valid older-position
+association; event `13653` no longer has a local-use association. Local clusters **182 -> 183**,
+located member events **6185 -> 6187**, unlocated events **3 -> 1**, equipment windows **641 -> 644**.
+Changing the clock can recover formerly stale samples as well as reject future ones, so located
+counts need not decrease. All retained use positions and both member-position roles resolved to
+raw player ticks with exact actual timestamps, no future samples and correct ages. Eight local/
+equipment JSON arrays matched DuckDB row-for-row. Raw extraction hashes were unchanged.
+
+#### Migration
+
+Reports reject metrics versions other than 16, including incomplete version 16 files missing
+the equipment arrays. Run `metrics` again before `report` / `player-review`. Existing extraction
+schema 3 data is supported **only with unknown equipment**: its lossy `items` names, omitted
+generic items and truncated slots cannot be repaired using purchases. No automatic renaming,
+delivery inference, default empty inventory or zero cooldown is applied to old data.
+
+To obtain the new evidence, re-extract a **local** replay into a separate output root first:
+
+```sh
+mvn -q verify
+java -jar target/dota-replay-etl-0.1.0-SNAPSHOT.jar pipeline replays/8987316716.dem \
+  --out out/equipment-validation --report --player-review nevermore
+```
+
+This produces extraction schema 4 and metrics schema 16 at
+`out/equipment-validation/8987316716/`, leaving `out/8987316716/` intact. No download is required.
+After inspecting the independent result, either use that directory or explicitly re-run extraction
+at the desired output root. Re-extraction there invalidates its old metrics/prompts. Recompute
+downstream artifacts together; do not mix sample/event IDs across generations. A schema-4 result
+needs only `metrics`, then `report` / `player-review`, for subsequent metric/report-only updates.
+
+#### Contracts
+
+- `item_timeline` still preserves **every PURCHASE**, including identical repeats. It is not
+  linked one-to-one to inventory entities: recipes, combinations, transfers and consumable stacks
+  make that inference unsafe. Raw `combatlog.event_id` retains the underlying event evidence.
+- `equipment_samples` includes all roster-player samples, with `sample_id`, `previous_sample_id`,
+  `player`, `hero_key`, `team`, `tick`, `raw_sample_t`, horn-normalized `sample_t`, source/clock,
+  slot count and completeness. JSON and DuckDB store the same rows. For compactness only
+  occupied/unknown slot entries are retained here; explicit empty entries remain in raw extraction.
+  Omitted slots mean empty **only in a complete sample with a validated slot count**.
+- `equipment_changes` compares the same player's immediately adjacent samples by `entity_uid`.
+  At most 5 seconds apart and both complete: `appeared_observed`, `slot_moved_observed`, or
+  `disappeared_observed`. Otherwise differences are `comparison_unknown`. `from_slot`, `to_slot`,
+  both sample IDs/times and observed gap are retained. Disappearance means not observed in the
+  selected hero's inventory, **not sold**: courier transfer, ground drop, consumption, combination,
+  destruction, or other transitions are not distinguished. Counter-only updates are in snapshots,
+  not inventory change rows. No sample creates a sale event.
+- `equipment_first_observations` is per player and canonical item **type**, not per purchase:
+  `inventory` includes stash/unknown slots; `carried` includes main/backpack/TP/neutral/enhancement
+  but excludes stash/unknown slots; `main` means slots classified as main. `sample_t` is the first
+  observed upper endpoint. `lower_bound_t` is the previous complete sample only if at most 5 seconds
+  earlier; otherwise it and `uncertainty_sec` are null (unbounded, not zero). These bounds describe
+  the first **observed transition**, not proof that the item never existed between earlier samples.
+  Sampling may miss short-lived items and rapid slot swaps. Partial samples can establish presence
+  of a resolved item but never absence of unresolved items.
+- `equipment_windows` keys death evidence by `(context_type='death', context_id=kill_id, hero_key)`
+  and local evidence by `('local_fight', fight_id, hero_key)`. The anchors are death time and local
+  fight start respectively. Select the latest snapshot at or before the anchor **before** checking
+  completeness and a maximum age of 5 seconds (inclusive). No future snapshots or fallback behind
+  a newer incomplete/identity-unknown/clock-unknown snapshot. Stale/missing/partial data has null
+  window slots, retains available sample metadata, and never becomes an empty inventory assertion.
+  Observation order uses replay tick, so a newer missing-clock record cannot be bypassed just
+  because its scheduled label precedes an older record's actual observation clock. For missing or
+  nonfinite observation clocks the scheduled label is retained only to locate an unknown blocker,
+  not as a valid equipment observation or reliable age.
+  Death incidents also embed their matching window as `incidents.deaths[].equipment`.
+- Local equipment contexts require membership with `presence_events > 0`; credited-only illusion
+  owners have no body equipment context. Equipment at the start does not imply the hero was present
+  for the entire fight, or that equipment stayed unchanged until its end.
+- `equipment_uses` links only real hero ITEM events with `roster_team_match` or verified non-illusion
+  `hero_action_identity`. Death bounds are `[death-15, death]`; local bounds are `[start, end]`.
+  Local uses additionally require that member's latest living, valid position at most 5 seconds old,
+  within 2400 units of a member event involving that body and at most 5 seconds from that event.
+  `member_event_id`, position sample/time/age/coordinates, raw/normalized action time, event ID,
+  actual attacker and attribution/association source are retained. No full-map time-only join.
+  These are associated action records, not extra clustering seeds or additional damage members.
+  **No recorded use does not mean non-use**, and no successful cast/cancel analysis is claimed.
+- `availability` is always `unknown`. `cooldown_remaining_sec` (`m_fCooldown`, seconds remaining
+  at the sample, not an absolute expiry time) and `item_charges` (`m_iCurrentCharges`, item count,
+  not a universal number of casts) are provided only for BKB and Magic Wand on audited build 10836.
+  Other items/builds, missing fields, negative sentinels and nonfinite cooldowns remain null.
+  BKB's item count 0 is a real observed value, not evidence it needs charges or cannot be cast.
+  Cooldown 0 is **not** operational availability: disables/mute/silence interactions, death,
+  mana, backpack reactivation, targets and other restrictions are not combined into an eligibility
+  model. Counters are not extrapolated from an old sample to the anchor. Ability-charge restoration,
+  secondary charges, frozen cooldown and backpack-enable fields are **not provided as interpreted metrics**.
+  `parameters.equipment` records limits, replay/audited build, counter item scope, source and units.
+
+#### Replay Audit
+
+Audited locally on 2026-09-08: match `8987316716`, build `10836`, replay SHA-256
+`e1a3ab5b048ba9c4fa855bc412a80e38649af218003856818a97e2eb7cadccd0`, horn offset `231.4`.
+The initial inventory audit below preceded the position-clock correction; its local IDs/counts
+are historical. Corrected local counts and clock guarantees are listed above.
+
+- Datatable/entity inspection reported `m_hItems = 25`; querying paths beyond 24 returned null
+  values despite resolvable field paths, so field-path existence alone is not used as array length.
+  Empty Source-2 handles were `16777215`. EntityNames mapped `CDOTA_Item_BlinkDagger` to `item_blink`,
+  `CDOTA_Item_IronwoodBranch` to `item_branches`, and `CDOTA_Item_QuellingBlade` to `item_quelling_blade`.
+  Generic `CDOTA_Item` had an unresolved name index at creation in the probe; no named generic item
+  appeared in this replay's player snapshots. It now follows the same name-table path, never a DT
+  fallback, and remains unknown if the table cannot identify it.
+- Actual occupied indices included 0..11 and 15..17. Slots 6..8 showed repeated swaps with 0..5
+  (backpack/main); the script inventory enum places the six stash slots at 9..14
+  ([DOTAScriptInventorySlot_t](https://docs.moddota.com/lua_server_enums/#dotascriptinventoryslot_t)).
+  Slot 9 held shop recipes and Blink before disappearing from stash and appearing later in main.
+  All 20,919 occupied slot-15 samples were `item_tpscroll`. Slots 16/17 each had 16,444 occupied
+  samples; entity updates independently showed `m_bIsNeutralActiveDrop=true` for slot-16 items
+  (e.g. Chipped Vest/Weighted Dice) and `m_bIsNeutralPassiveDrop=true` for slot-17 enhancements.
+  Those flags name neutral categories, **not whether the item has an active cast**. Slots 18..24
+  stayed empty and are not assigned invented roles.
+- Legion Commander Blink: PURCHASE `871.3667` (event `18060`), first inventory observation in
+  stash slot 9 at `871.9`, disappeared from selected inventory at `873.7334`, first main/carried
+  observation in slot 0 at `890.8001`. Previous complete sample `889.7667`, observed interval
+  `1.0334` seconds. Windrunner Blink: purchase `884.3334`, stash `885.0`, main slot 2 `909.7667`.
+  The gaps are observable; a courier route or exact delivery is not inferred.
+- Nevermore BKB: purchase `1469.9667` (event `38420`), first main slot 3 observation `1470.8001`
+  after complete sample `1469.7334` (interval `1.0667` seconds), recorded use `1473.1334`
+  (event `38656`) linked to local fight `133`. That fight started at `1462.0001`; its equipment
+  snapshot is `1461.8001`, age `0.2`, **without BKB**. Later possession/use is not backfilled into
+  the start snapshot. Nevermore death `37` at `1256.7667` uses sample `1256.7334`, age `0.0333`.
+- Counter probe for that BKB: raw times `1704.0334`, `1705.0334`, `1706.0334` had `m_fCooldown`
+  `0`, `94.40001`, `93.400024`, around ITEM event raw `1704.5334`. Magic Wand owner ID 6
+  had charges `10 -> 0` from raw `1703.0001 -> 1704.0334`, with cooldown `0 -> 14.699999`,
+  then `13.699995` one second later. `m_fAbilityChargeRestoreTimeRemaining=-1000000` and
+  `m_bItemEnabled=false` even around recorded uses demonstrate why those names/zeros/flags are
+  not blindly interpreted as cast eligibility. Owner IDs here are entity owner IDs, not roster indices.
+- Independent output contained 24,500 equipment samples (23,344 complete, 1,156 identity-unknown
+  early roster samples), 1,275 inventory changes, 801 first-observation rows, 641 equipment
+  windows and 462 associated use rows (one event can belong to a death and a local context).
+  There were 193 slot moves and 494 observed disappearances, **zero inferred sales**.
+  Five equipment tables were compared row-for-row and field-for-field with JSON, including nulls
+  and nested slots. No window belonged to a credited-only local member. Existing 79 scored deaths
+  and one Aegis respawn remained classified separately. Combatlog and wards were byte-identical
+  to the original extraction; player rows matched exactly after excluding equipment/items. Original
+  `out/8987316716` match/player/combat/metrics JSON/DB hashes were unchanged.
+
 ### Schema 15 Local Interactions
 
-Re-run only `metrics`, `report` and `player-review` on existing extraction output. Schema 14
-and incomplete schema 15 reports are rejected; no download or replay re-extraction is needed.
+Historical migration to schema 15 required only `metrics`, `report` and `player-review` on existing
+extraction output. For current schema 16 equipment evidence, use the migration instructions above.
 CLI arguments are unchanged. Death classification and attribution rules from schema 14 remain intact.
 
 - `local_fights` is a new layer, separate from the unchanged `teamfights` global activity windows.
@@ -438,3 +622,12 @@ writer round-trip / overwrite semantics, the DuckDB metrics computation (summary
 kills, teamfights, curves, item timeline, damage) against a synthetic fixture, the
 persisted DuckDB tables, the match review prompt assembly, the single-player review prompt
 assembly, HTTP User-Agent wiring, and CLI argument validation (including `pipeline`).
+
+Schema 16 adds deterministic unit/integration coverage for canonical item identity, audited slot
+boundaries, delayed holding after duplicate purchases, stash/backpack/main transitions, disappearance
+versus missing data, stale/future/nonfinite clocks, latest-invalid blocking, player isolation,
+real-unit and local-body action attribution, inclusive window bounds, counter null versus zero,
+report schema rejection and every equipment JSON field versus DuckDB. `mvn -q verify` runs the
+full suite and packages the executable jar; the position-clock correction passed all 101 tests,
+including initially failing future/missing/nonfinite/actual-age regressions and the delayed
+observed-clock 5-second boundary. Tests use fixed clocks and local in-memory DuckDB, not a network.

@@ -564,7 +564,8 @@ public final class ReportGenerator {
         if (metrics.path("schema_version").asInt(-1) != dev.dota.etl.util.BuildInfo.METRICS_SCHEMA_VERSION) {
             throw new IllegalStateException("metrics.json has an incompatible schema_version; run `metrics` again");
         }
-        for (String section : List.of("local_fights", "local_fight_events", "local_fight_players")) {
+        for (String section : List.of("local_fights", "local_fight_events", "local_fight_players",
+            "equipment_samples", "equipment_changes", "equipment_first_observations", "equipment_windows", "equipment_uses")) {
             if (!metrics.path(section).isArray()) {
                 throw new IllegalStateException("metrics.json is missing " + section + "; run `metrics` again");
             }
@@ -583,6 +584,9 @@ public final class ReportGenerator {
     static void appendFactScope(StringBuilder sb, JsonNode metrics) {
         JsonNode summary = metrics.path("summary");
         sb.append("## 数据口径与对账\n\n");
+        sb.append("- 购买 ≠ 首次观察持有 ≠ 主栏 ≠ 可用；装备快照区分主栏/背包/仓库/TP/中立槽，未知保持未知。")
+            .append("冷却/充能仅对已核验物品/build 提供采样值，其他为未知；冷却 0 也不证明可操作，可用性 unknown。")
+            .append("不能断言未记录使用就是没开，也不能把装备消失当卖出。\n");
         sb.append("- 团队比分来源：").append(summary.path("team_kills_source").asText("unknown"))
           .append("；官方团队击杀可含塔等非玩家末击，不必等于个人击杀之和。\n");
         for (JsonNode row : summary.path("player_kills_by_team")) {
