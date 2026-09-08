@@ -158,6 +158,7 @@ public final class MetricsRunner {
                 addKills(conn, metrics);
                 new DeathIncidentBuilder(conn).addTo(metrics);
                 addTeamfights(conn, metrics);
+                new LocalFightBuilder(conn).addTo(metrics);
                 addObjectives(conn, metrics);
                 addFarmCurves(conn, metrics);
                 addGoldCurves(conn, metrics);
@@ -451,7 +452,7 @@ public final class MetricsRunner {
         String source = columns.contains("damage_source") ? "c.damage_source" : "NULL::VARCHAR";
         conn.createStatement().execute(sql("""
             CREATE TEMP TABLE combatlog_v AS
-            SELECT ROW_NUMBER() OVER () event_id, c.*, {} AS target_is_illusion,
+            SELECT ROW_NUMBER() OVER (ORDER BY c.t,c.target,c.attacker,c.type,to_json(c)) event_id, c.*, {} AS target_is_illusion,
                    CASE WHEN {} AND c.attacker_hero AND h.team <> c.attacker_team
                           AND {} = 'npc_dota_hero_dark_seer' AND ds.team=c.attacker_team
                           THEN 'dark_seer'

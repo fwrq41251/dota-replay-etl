@@ -3,7 +3,7 @@ package dev.dota.etl.util;
 public final class BuildInfo {
 
     public static final int EXTRACTION_SCHEMA_VERSION = 3;
-    public static final int METRICS_SCHEMA_VERSION = 14;
+    public static final int METRICS_SCHEMA_VERSION = 15;
 
     public static String version() {
         String version = BuildInfo.class.getPackage().getImplementationVersion();

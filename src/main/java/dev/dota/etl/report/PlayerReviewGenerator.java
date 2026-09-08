@@ -81,7 +81,7 @@ public final class PlayerReviewGenerator {
         appendDeathWindows(sb, metrics, heroKey);
         appendEconomy(sb, metrics, heroKey);
         appendDamage(sb, metrics, heroKey);
-        appendTeamfights(sb, metrics, heroKey);
+        LocalFightReport.append(sb, metrics, heroKey);
         appendPosition(sb, metrics, target);
         appendTeamObjectives(sb, metrics, target);
         appendQuestions(sb);
@@ -566,113 +566,6 @@ public final class PlayerReviewGenerator {
         sb.append('\n');
     }
 
-    private void appendTeamfights(StringBuilder sb, JsonNode m, String heroKey) {
-        List<double[]> kills = new ArrayList<>();
-        List<double[]> myKills = new ArrayList<>();
-        List<double[]> myDeaths = new ArrayList<>();
-        for (JsonNode k : m.path("kills")) {
-            int vt = k.path("victim_team").asInt();
-            if (vt == 2 || vt == 3) {
-                kills.add(new double[]{k.path("t").asDouble(), vt});
-            }
-            if (k.path("killer_key").asText("").equals(heroKey)) {
-                myKills.add(new double[]{k.path("t").asDouble(), 0});
-            }
-            if (k.path("victim_key").asText("").equals(heroKey)) {
-                myDeaths.add(new double[]{k.path("t").asDouble(), 0});
-            }
-        }
-        List<JsonNode> fights = new ArrayList<>();
-        m.path("teamfights").forEach(fights::add);
-        fights.sort((a, b) -> Double.compare(a.path("start").asDouble(), b.path("start").asDouble()));
-        List<JsonNode> mine = new ArrayList<>();
-        for (JsonNode f : fights) {
-            JsonNode stats = f.path("player_stats").path(heroKey);
-            if (f.has("player_stats")) {
-                if (stats.path("damage_dealt").asLong() >= 100
-                    || stats.path("damage_taken").asLong() >= 100
-                    || stats.path("kills").asLong() > 0 || stats.path("deaths").asLong() > 0) {
-                    mine.add(f);
-                }
-            } else {
-                for (JsonNode part : f.path("participants")) {
-                    if (part.asText().equals(heroKey)) {
-                        mine.add(f);
-                        break;
-                    }
-                }
-            }
-        }
-        if (mine.isEmpty()) {
-            return;
-        }
-        List<JsonNode> topDamage = new ArrayList<>(mine);
-        topDamage.sort((a, b) -> Long.compare(b.path("hero_damage").asLong(), a.path("hero_damage").asLong()));
-        Map<Integer, Boolean> notableIds = new LinkedHashMap<>();
-        for (int i = 0; i < Math.min(8, topDamage.size()); i++) {
-            notableIds.put(topDamage.get(i).path("id").asInt(), true);
-        }
-        for (JsonNode f : mine) {
-            double start = f.path("start").asDouble();
-            double end = f.path("end").asDouble();
-            if (hasEventInWindow(myKills, start, end) || hasEventInWindow(myDeaths, start, end)) {
-                notableIds.put(f.path("id").asInt(), true);
-            }
-        }
-        mine.removeIf(f -> !notableIds.containsKey(f.path("id").asInt()));
-        sb.append("## 本选手有实质参与的全地图活动窗口\n\n");
-        sb.append("仅展示个人发生击杀/阵亡的窗口，以及全场伤害最高的 8 个本人参与窗口。")
-          .append("参与阈值为个人造成或承受至少 100 点英雄伤害，或发生击杀/阵亡；")
-           .append("死亡交换为阵亡数，经济列为窗口内 GOLD 带符号汇总（含建筑/肉山/被动/支出）。")
-           .append("这是窗口相关变化，不代表团战因果收益；可能合并异地战斗，也不证明本人本体到场。\n\n");
-        sb.append("| 开始 | 全场伤害 | 天辉阵亡 | 夜魇阵亡 | 天辉/夜魇经济 | 个人输出/承伤 | 个人击杀/阵亡 |\n|---|---|---|---|---|---|---|\n");
-        List<JsonNode> byDmg = new ArrayList<>(mine);
-        byDmg.sort((a, b) -> Double.compare(b.path("hero_damage").asDouble(), a.path("hero_damage").asDouble()));
-        Map<String, Boolean> hl = new LinkedHashMap<>();
-        for (int i = 0; i < Math.min(6, byDmg.size()); i++) {
-            hl.put(ReportGenerator.fmt(byDmg.get(i).path("start").asDouble()), true);
-        }
-        for (JsonNode f : mine) {
-            double start = f.path("start").asDouble();
-            double end = f.path("end").asDouble();
-            int rad = 0;
-            int dire = 0;
-            long myKillCount = 0;
-            long myDeathCount = 0;
-            for (double[] k : kills) {
-                if (k[0] >= start && k[0] < end) {
-                    if (k[1] == 2) {
-                        rad++;
-                    } else {
-                        dire++;
-                    }
-                }
-            }
-            for (double[] k : myKills) {
-                if (k[0] >= start && k[0] < end) {
-                    myKillCount++;
-                }
-            }
-            for (double[] k : myDeaths) {
-                if (k[0] >= start && k[0] < end) {
-                    myDeathCount++;
-                }
-            }
-            sb.append('|').append(hl.containsKey(ReportGenerator.fmt(start)) ? "★" : "")
-              .append(ReportGenerator.gameTime(start))
-              .append('|').append(f.path("hero_damage").asLong())
-              .append('|').append(rad).append('|').append(dire).append('|');
-            JsonNode eco = f.path("economy");
-            sb.append(ReportGenerator.fmtK(eco.path("radiant").path("gold").asLong())).append('/')
-              .append(ReportGenerator.fmtK(eco.path("dire").path("gold").asLong())).append('|');
-            JsonNode stats = f.path("player_stats").path(heroKey);
-            sb.append(stats.path("damage_dealt").asLong()).append('/')
-              .append(stats.path("damage_taken").asLong()).append('|')
-              .append(myKillCount).append('/').append(myDeathCount).append("|\n");
-        }
-        sb.append('\n');
-    }
-
     private void appendPosition(StringBuilder sb, JsonNode metrics, JsonNode target) throws Exception {
         if (!Files.exists(playersJson)) {
             return;
@@ -823,15 +716,6 @@ public final class PlayerReviewGenerator {
         sb.append("3. **打钱路线**：结合经济对比（是否停滞、何时被反超）与打钱/位置分析（各阶段在对方半场的比例），评价刷钱与地图控制；\n");
         sb.append("4. **关键决策**：只评价数据能够证明的决策；可结合建筑、肉山、守卫实体、排眼和烟雾时间线判断，但不得把附近守卫直接等同于实际视野；\n");
         sb.append("5. **改进优先级**：给出一条按收益排序的可执行改进清单（每条必须引用上面数据）。\n");
-    }
-
-    private static boolean hasEventInWindow(List<double[]> events, double start, double end) {
-        for (double[] event : events) {
-            if (event[0] >= start && event[0] < end) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private static String wardLabel(String type) {

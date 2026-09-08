@@ -21,6 +21,9 @@ class PlayerReviewGeneratorTest {
     private Path writeFixture() throws Exception {
         ObjectNode metrics = MAPPER.createObjectNode();
         metrics.put("schema_version", dev.dota.etl.util.BuildInfo.METRICS_SCHEMA_VERSION);
+        metrics.putArray("local_fights");
+        metrics.putArray("local_fight_events");
+        metrics.putArray("local_fight_players");
 
         ObjectNode summary = metrics.putObject("summary");
         summary.put("duration_sec", 300.0);
@@ -145,7 +148,7 @@ class PlayerReviewGeneratorTest {
         assertTrue(prompt.contains("经济对比"), "economy section");
         assertTrue(prompt.contains("|2|800|未知|"), "missing opponent income is not zero");
         assertTrue(prompt.contains("对英雄总伤害：1000"), "damage total");
-        assertTrue(prompt.contains("有实质参与的全地图活动窗口"), "teamfight section");
+        assertTrue(prompt.contains("局部交战（时间、空间与真实交互约束）"), "local fight section");
         assertTrue(prompt.contains("个人输出/承伤"), "personal fight evidence");
         assertTrue(prompt.contains("打钱/位置分析"), "position section");
         assertTrue(prompt.contains("累计获得金币 800，补刀 6（1.2/分钟），反补 1"), "farm totals line");
@@ -167,7 +170,7 @@ class PlayerReviewGeneratorTest {
         assertTrue(!prompt.contains("最高的英雄 axe"));
         assertTrue(prompt.contains("total_earned_gold"));
         assertTrue(prompt.contains("不是到手或可用时间"));
-        assertTrue(prompt.contains("不代表团战因果收益"));
+        assertTrue(prompt.contains("经济因果归属未知"));
     }
 
     @Test

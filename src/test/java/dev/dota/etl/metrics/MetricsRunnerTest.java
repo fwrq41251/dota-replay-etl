@@ -112,6 +112,14 @@ class MetricsRunnerTest {
         assertEquals(5, m.path("kills").size(), "Aegis is retained separately, not a scored death");
         JsonNode aegis = m.path("hero_death_events").get(2);
         assertEquals("aegis_respawn", aegis.path("death_class").asText());
+        int localAegis = 0;
+        for (JsonNode event : m.path("local_fight_events")) {
+            if (event.path("t").asDouble() == 111) {
+                assertEquals("aegis_respawn", event.path("death_class").asText());
+                localAegis++;
+            }
+        }
+        assertEquals(1, localAegis);
         JsonNode kill = m.path("kills").get(2);
         assertEquals("dark_seer", kill.path("killer_key").asText());
         assertEquals("npc_dota_hero_pudge", kill.path("attacker_unit").asText());
@@ -280,7 +288,7 @@ class MetricsRunnerTest {
     @Test
     void computesSummary() throws Exception {
         ObjectNode m = runMetrics();
-        assertEquals(14, m.path("schema_version").asInt());
+        assertEquals(15, m.path("schema_version").asInt());
         assertEquals(5, m.path("parameters").path("teamfight_bucket_sec").asInt());
         com.fasterxml.jackson.databind.JsonNode s = m.path("summary");
         assertEquals(2, s.path("team_kills").size());
@@ -625,6 +633,16 @@ class MetricsRunnerTest {
                 }
             }
             assertEquals(m.path("teamfights").size(), teamfights);
+            for (String table : List.of("local_fights", "local_fight_events", "local_fight_players")) {
+                String order = table.equals("local_fights") ? "id"
+                    : table.equals("local_fight_events") ? "t,event_id" : "fight_id,hero_key";
+                var rows = MAPPER.createArrayNode();
+                try (var rs = conn.createStatement().executeQuery(
+                        "SELECT to_json(r) FROM (SELECT * FROM " + table + " ORDER BY " + order + ") r")) {
+                    while (rs.next()) rows.add(MAPPER.readTree(rs.getString(1)));
+                }
+                assertEquals(m.path(table), rows, "every JSON field must equal persisted " + table);
+            }
             long ecoRows = 0;
             long radGold = -1;
             long direXp = -1;
@@ -687,6 +705,29 @@ class MetricsRunnerTest {
             }
             assertEquals(costRows, joinedCosts, "kill_id should join kills to death_costs without loss");
         }
+    }
+
+    @Test
+    void localResultsAreStableAcrossInputOrderAndIgnoreConcurrentEconomy() throws Exception {
+        ObjectNode first = runMetrics();
+        Path combat = dir.resolve("combatlog.ndjson");
+        var rows = new ArrayList<>(Files.readAllLines(combat));
+        java.util.Collections.reverse(rows);
+        Files.write(combat, rows);
+        ObjectNode reordered = new MetricsRunner(combat, dir.resolve("players.ndjson")).run();
+        for (String section : List.of("local_fights", "local_fight_events", "local_fight_players")) {
+            assertEquals(first.path(section), reordered.path(section), section);
+        }
+        rows.add("""
+            {"t":103,"type":"DOTA_COMBATLOG_GOLD","target":"npc_dota_hero_pudge","value":999999}
+            """);
+        rows.add("""
+            {"t":103,"type":"DOTA_COMBATLOG_XP","target":"npc_dota_hero_lion","value":888888}
+            """);
+        Files.write(combat, rows);
+        ObjectNode economy = new MetricsRunner(combat, dir.resolve("players.ndjson")).run();
+        assertEquals(first.path("local_fights"), economy.path("local_fights"));
+        assertEquals(first.path("local_fight_players"), economy.path("local_fight_players"));
     }
 
     @Test

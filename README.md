@@ -157,6 +157,54 @@ game timestamps in this extraction stream and are normalized to horn-relative ti
 
 ## Metrics
 
+### Schema 15 Local Interactions
+
+Re-run only `metrics`, `report` and `player-review` on existing extraction output. Schema 14
+and incomplete schema 15 reports are rejected; no download or replay re-extraction is needed.
+CLI arguments are unchanged. Death classification and attribution rules from schema 14 remain intact.
+
+- `local_fights` is a new layer, separate from the unchanged `teamfights` global activity windows.
+  It includes single-hit harassment, not just elevated-activity episodes. Candidate events are
+  positive enemy damage from hero units to verified real hero targets, and hero deaths other than
+  known illusion deaths (including non-player last hits). Creep/tower damage does not seed clusters;
+  heals, casts and modifiers do not currently seed clusters either.
+- Event locations use the verified real target's latest player sample at or before the event,
+  no older than 5 seconds, matched by hero and team. Damage requires a living target sample. Nonfinite
+  and `(0,0)` positions are rejected. Both target and attacker select the latest sample **before**
+  validating HP/coordinates: a newer dead or invalid sample blocks fallback to an older valid one.
+  DEATH targets may have zero HP but still need valid coordinates. Combat-log coordinates are deliberately not used here because
+  the extraction does not establish a general target-position contract for them. Missing, stale or
+  identity-unknown targets remain explicit unlocated `local_fight_events` with null `fight_id`/position;
+  they are not silently dropped or attached through time alone.
+- Events sorted by `(t,event_id)` join the first compatible cluster: a verified real body must be
+  shared with a member at most 5 seconds earlier, total cluster duration must be at most 30 seconds,
+  and **every** pair of member target positions must be within 2400 world units. Bounds are inclusive.
+  Clusters are never unioned via a bridging hero. This intentionally splits long or moving fights
+  rather than allowing continuous harassment or a shared hero to connect distant locations forever.
+- `credited_attacker_key`/`attribution_source` describe output ownership, not presence. Attacker
+  presence additionally requires direct real-hero attribution and a living as-of sample within
+  2400 units of the event target. Illusion owners are never given presence or used as connecting
+  bodies merely because their illusions deal damage. Target/attacker sample times, ages, coordinates,
+  presence keys, actual unit names, `event_id` and `kill_id` are retained for tracing to raw DB events.
+- `local_fight_players` aggregates only member events: output, damage taken, kills, deaths and
+  presence evidence counts. There is no full-map time join for personal participation or deaths.
+  `scored_deaths`, `unknown_deaths` and `aegis_respawns` are separate; `deaths` includes the first two
+  only. An Aegis event can be a member interaction but never a scored death or personal kill.
+  Attacker kills require opposing legal teams 2/3; denies and suicides retain the victim death
+  without crediting a personal kill. This does not change the legacy match-wide `kills` list.
+- Centers are event-weighted target-position means; min/max x/y bound those observations, not all
+  hero bodies. `kind` is a presence-count heuristic: at least 3v3 => `teamfight`; a verified death
+  with 1v2+ => `pickoff`; other 3+ bodies with both sides => `skirmish`; both sides and no deaths
+  => `harassment`; otherwise `unknown`. These labels do not establish intent or complete attendance.
+- Local `economy_status` is `unknown_no_spatial_causal_attribution`. No full-team simultaneous income
+  is displayed as local profit, and no participant-window income is fabricated. Existing global-window
+  economy remains compatibility/comparison data only. Death-follow-up objectives remain temporal
+  associations, never automatic causal conversions.
+- JSON arrays and DuckDB tables `local_fights`, `local_fight_events`, `local_fight_players` contain
+  the same rows and fields. Stable ordering uses fight ID, `(t,event_id)`, and `(fight_id,hero_key)`
+  respectively. Combat event IDs now use canonical content ordering (exact duplicates are interchangeable);
+  IDs should not be mixed across schema generations. Parameters are in `parameters.local_fights`.
+
 ### Schema 13 Semantic Corrections
 
 Schema 14 tightens these rules after review: missing illusion flags no longer establish real-unit
@@ -277,7 +325,7 @@ Notes:
   GOLD / XP events attributed via hero -> team; buyback costs count as negative gold,
    building / Roshan gold is included), plus `gold_delta` / `xp_delta` as radiant minus dire.
   The knobs (`BUCKET_SEC`, `WEIGHT_DEATH`,
-  `MIN_ACTIVE_SCORE`) live at the top of `MetricsRunner`.
+  `MIN_ACTIVE_SCORE`) live at the top of `MetricQueries`.
 - `objectives` is the objective timeline. `roshan_kills` lists every Roshan death with its time,
   the last-hitting hero and the killing team. `building_kills` lists every
   `DOTA_COMBATLOG_TEAM_BUILDING_KILL`: time, building entity, `kind` (`tower` / `rax` / `ancient`
@@ -332,8 +380,8 @@ last-hits-per-minute) from the player resource.
 The global activity timeline includes each window's per-team signed gold change (see
 `teamfight.economy`), which must not be interpreted as causal fight profit.
 A new **客观目标时间线** section lists every Roshan kill (time + killer + team) and every
-building kill (time + building + destroying team) in game-clock order, so "this teamfight
-converted into a tower / Roshan / throne" becomes a factual claim. The final ancient kill
+building kill (time + building + destroying team) in game-clock order. A later objective is not
+proof that a fight caused or enabled it. The final ancient kill
 marks the end of the game.
 Copy `prompt.md` into any LLM to get the report, or paste it into a future `--api` mode.
 
@@ -344,8 +392,9 @@ review prompt for one hero into `player-review-<hero>.md` (dry-run). The selecto
 roster entry by `hero_key`, hero name, player name, or player index. Beyond the match-level
 metrics it adds: the hero's full purchase timeline, kills/deaths with positions, an income
 comparison against the enemy team's top earner using player-resource counters (not signed GOLD),
-per-minute hero damage, the fights the hero actually participated in (with kill/death outcome
-and per-team gold change per fight), and a farming/position table derived from `players.ndjson`
+per-minute hero damage, local fights with the hero's member-event output or body-presence evidence
+(separately labelled, with member-only kill/death statistics and unknown causal economy), and a
+farming/position table derived from `players.ndjson`
 (the hero's inferred lane with its confidence is shown at the top; the table reports the share
 of time spent in the enemy half and deep in enemy territory per game phase, split along the
 river diagonal).

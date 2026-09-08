@@ -23,6 +23,9 @@ class ReportGeneratorTest {
     private Path writeFixture() throws Exception {
         ObjectNode metrics = MAPPER.createObjectNode();
         metrics.put("schema_version", dev.dota.etl.util.BuildInfo.METRICS_SCHEMA_VERSION);
+        metrics.putArray("local_fights");
+        metrics.putArray("local_fight_events");
+        metrics.putArray("local_fight_players");
 
         ObjectNode summary = metrics.putObject("summary");
         summary.put("duration_sec", 1000.0);
@@ -132,7 +135,7 @@ class ReportGeneratorTest {
     void rejectsOldMissingAndFutureSchemasEvenWithoutReplayHash() throws Exception {
         Path metrics = writeFixture();
         ObjectNode m = (ObjectNode) MAPPER.readTree(Files.readString(metrics));
-        for (int version : new int[]{0, 13, 15}) {
+        for (int version : new int[]{0, 13, 14, 16}) {
             m.put("schema_version", version);
             Files.writeString(metrics, m.toString());
             org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
@@ -140,6 +143,13 @@ class ReportGeneratorTest {
             org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
                 () -> new PlayerReviewGenerator(dir, "pudge").generatePrompt());
         }
+        m.put("schema_version", dev.dota.etl.util.BuildInfo.METRICS_SCHEMA_VERSION);
+        m.remove("local_fight_events");
+        Files.writeString(metrics, m.toString());
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+            () -> new ReportGenerator(metrics, dir.resolve("match.json"), dir.resolve("prompt.md")).generatePrompt());
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+            () -> new PlayerReviewGenerator(dir, "pudge").generatePrompt());
     }
 
     @Test

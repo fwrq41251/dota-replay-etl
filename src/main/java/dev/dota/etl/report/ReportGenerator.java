@@ -75,6 +75,7 @@ public final class ReportGenerator {
         appendEconomy(sb, metrics);
         appendKills(sb, metrics);
         appendTeamfights(sb, metrics);
+        LocalFightReport.append(sb, metrics, null);
         appendObjectives(sb, metrics);
         appendKeyItems(sb, metrics);
         appendMvpQuestion(sb);
@@ -361,8 +362,8 @@ public final class ReportGenerator {
         }
         sb.append("## 全地图活动窗口时间线（共 ").append(fights.size()).append(" 个窗口，★ 为高伤害窗口）\n\n");
         sb.append("死亡交换为窗口内英雄阵亡数；天辉/夜魇经济为该窗口内各队英雄获得金币的净变化")
-          .append("（含击杀/补刀/被动/建筑/肉山，支出为负）。这是窗口相关变化，不代表团战因果收益；可能合并异地战斗。\n\n");
-        sb.append("| 开始 | 持续 | 英雄伤害 | 天辉阵亡 | 夜魇阵亡 | 死亡交换 | 天辉经济 | 夜魇经济 | 参战英雄 |\n");
+          .append("（含击杀/补刀/被动/建筑/肉山，支出为负）。这是兼容比较层，不是局部交战；窗口相关变化不代表团战因果收益，可能合并异地战斗。\n\n");
+        sb.append("| 开始 | 持续 | 英雄伤害 | 天辉阵亡 | 夜魇阵亡 | 死亡交换 | 天辉经济 | 夜魇经济 | 活动归属英雄（非本体到场） |\n");
         sb.append("|---|---|---|---|---|---|---|---|---|\n");
         List<JsonNode> sorted = new ArrayList<>();
         fights.forEach(sorted::add);
@@ -562,6 +563,11 @@ public final class ReportGenerator {
     static void validateLineage(JsonNode metrics, JsonNode match) {
         if (metrics.path("schema_version").asInt(-1) != dev.dota.etl.util.BuildInfo.METRICS_SCHEMA_VERSION) {
             throw new IllegalStateException("metrics.json has an incompatible schema_version; run `metrics` again");
+        }
+        for (String section : List.of("local_fights", "local_fight_events", "local_fight_players")) {
+            if (!metrics.path(section).isArray()) {
+                throw new IllegalStateException("metrics.json is missing " + section + "; run `metrics` again");
+            }
         }
         if (match == null || !match.hasNonNull("source_replay_sha256")) {
             return;
