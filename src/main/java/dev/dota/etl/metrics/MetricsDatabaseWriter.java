@@ -10,6 +10,8 @@ final class MetricsDatabaseWriter {
     static void persist(Connection conn, Path output) throws Exception {
         try (Statement st = conn.createStatement()) {
             st.execute("ATTACH '" + escape(output) + "' AS out (TYPE duckdb)");
+            st.execute("CREATE OR REPLACE TABLE out.metric_metadata AS SELECT "
+                + dev.dota.etl.util.BuildInfo.METRICS_SCHEMA_VERSION + " AS schema_version");
             st.execute("CREATE OR REPLACE TABLE out.combatlog AS SELECT * FROM combatlog_v");
             st.execute("CREATE OR REPLACE TABLE out.players AS SELECT * FROM players_v");
             st.execute("CREATE OR REPLACE TABLE out.wards AS SELECT * FROM wards_v");
@@ -17,6 +19,7 @@ final class MetricsDatabaseWriter {
             st.execute("CREATE OR REPLACE TABLE out.dewards AS SELECT * FROM dewards");
             st.execute("CREATE OR REPLACE TABLE out.smoke_events AS SELECT * FROM smoke_events");
             st.execute("CREATE OR REPLACE TABLE out.kills AS SELECT * FROM hero_kills");
+            st.execute("CREATE OR REPLACE TABLE out.hero_death_events AS SELECT * FROM hero_death_events");
             st.execute("CREATE OR REPLACE TABLE out.hero_damage AS SELECT * FROM combatlog_v " +
                 "WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero");
             st.execute("CREATE OR REPLACE TABLE out.gold_curves AS " +

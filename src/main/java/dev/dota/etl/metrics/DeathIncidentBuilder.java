@@ -68,7 +68,7 @@ final class DeathIncidentBuilder {
                     putText(death, "location_source", rs.getString("location_source"));
                     putNumber(death, "location_age_sec", rs, "location_age_sec");
                 }
-                putLong(death, "victim_networth", rs, "networth");
+                putLong(death, "raw_networth", rs, "networth");
                 putLong(death, "first_observed_hp", rs, "first_hp");
                 putNumber(death, "last_bkb_use_age_sec", rs, "last_bkb_age_sec");
                 death.putArray("victim_actions");
@@ -80,6 +80,12 @@ final class DeathIncidentBuilder {
                 death.putArray("smoke_events");
                 death.putArray("other_deaths");
                 JsonNode kill = killById.get(id);
+                if (kill != null) {
+                    death.remove("killer_key");
+                    for (String field : new String[]{"killer", "killer_key", "attacker_unit", "attribution_source", "death_class"}) {
+                        if (kill.has(field)) death.set(field, kill.path(field).deepCopy());
+                    }
+                }
                 if (kill != null && kill.has("conceded_objective")) {
                     death.set("followup_objective", kill.path("conceded_objective").deepCopy());
                 }
@@ -111,7 +117,7 @@ final class DeathIncidentBuilder {
                        CASE c.type WHEN 'DOTA_COMBATLOG_ABILITY' THEN 'ability' ELSE 'item' END AS action_type,
                        {} AS name
                 FROM hero_kills k JOIN combatlog_v c
-                  ON c.attacker_key = k.target_key
+                  ON c.credited_attacker_key = k.target_key
                  AND c.t >= k.t - {} AND c.t <= k.t
                 WHERE c.type IN ('DOTA_COMBATLOG_ABILITY', 'DOTA_COMBATLOG_ITEM')
                   AND COALESCE({}, '') NOT LIKE '%power_treads%'
@@ -119,10 +125,11 @@ final class DeathIncidentBuilder {
                 """, inflictor, DEATH_INCIDENT_BEFORE_SEC, inflictor));
             st.execute(sql("""
                 CREATE TEMP TABLE incident_controls AS
-                SELECT k.kill_id, c.t - k.t AS offset_sec, c.attacker_key AS source,
+                SELECT k.kill_id, c.t - k.t AS offset_sec,
+                       COALESCE(c.credited_attacker_key, 'unknown (unit: ' || c.attacker || ')') AS source,
                        {} AS modifier
                 FROM hero_kills k JOIN combatlog_v c
-                  ON c.target_key = k.target_key
+                  ON c.target_player_key = k.target_key AND c.target_team=k.target_team
                  AND c.t >= k.t - {} AND c.t <= k.t
                 WHERE c.type = 'DOTA_COMBATLOG_MODIFIER_ADD'
                   AND (lower(COALESCE({}, '')) LIKE '%stun%'
@@ -140,10 +147,10 @@ final class DeathIncidentBuilder {
                 inflictor, inflictor, inflictor, inflictor));
             st.execute(sql("""
                 CREATE TEMP TABLE incident_damage_sources AS
-                SELECT k.kill_id, COALESCE(c.attacker_key, c.attacker, 'unknown') AS source,
+                SELECT k.kill_id, COALESCE(c.credited_attacker_key, 'unknown (unit: ' || c.attacker || ')', 'unknown') AS source,
                        SUM(COALESCE(c.value, 0)) AS damage, COUNT(*) AS events
                 FROM hero_kills k JOIN combatlog_v c
-                  ON c.target_key = k.target_key
+                  ON c.target_player_key = k.target_key
                  AND c.t >= k.t - {} AND c.t <= k.t
                 WHERE c.type = 'DOTA_COMBATLOG_DAMAGE'
                 GROUP BY k.kill_id, source
@@ -153,9 +160,9 @@ final class DeathIncidentBuilder {
                 CREATE TEMP TABLE incident_health_timeline AS
                 SELECT k.kill_id, c.t - k.t AS offset_sec,
                        {} AS hp_after, COALESCE(c.value, 0) AS damage,
-                       COALESCE(c.attacker_key, c.attacker, 'unknown') AS source
+                       COALESCE(c.credited_attacker_key, 'unknown (unit: ' || c.attacker || ')', 'unknown') AS source
                 FROM hero_kills k JOIN combatlog_v c
-                  ON c.target_key = k.target_key
+                  ON c.target_player_key = k.target_key
                  AND c.t >= k.t - {} AND c.t <= k.t
                 WHERE c.type = 'DOTA_COMBATLOG_DAMAGE' AND {} IS NOT NULL
                 ORDER BY k.kill_id, c.t
@@ -170,8 +177,8 @@ final class DeathIncidentBuilder {
                            AND lower(COALESCE({}, '')) LIKE '%black_king_bar%') AS last_bkb_age_sec
                 FROM hero_kills k
                 LEFT JOIN combatlog_v c ON c.t <= k.t AND (
-                  (c.target_key = k.target_key AND c.type='DOTA_COMBATLOG_DAMAGE' AND c.t >= k.t - {})
-                  OR (c.attacker_key = k.target_key AND c.type='DOTA_COMBATLOG_ITEM'
+                  (c.target_player_key = k.target_key AND c.type='DOTA_COMBATLOG_DAMAGE' AND c.t >= k.t - {})
+                  OR (c.credited_attacker_key = k.target_key AND c.type='DOTA_COMBATLOG_ITEM'
                     AND lower(COALESCE({}, '')) LIKE '%black_king_bar%'))
                 GROUP BY k.kill_id, k.t
                 """, health, health, inflictor, DEATH_INCIDENT_BEFORE_SEC, inflictor));

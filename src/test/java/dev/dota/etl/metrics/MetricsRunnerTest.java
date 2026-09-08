@@ -57,7 +57,7 @@ class MetricsRunnerTest {
             "{\"t\":200.0,\"type\":\"DOTA_COMBATLOG_DAMAGE\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"value\":60,\"attacker_team\":2,\"target_team\":3}",
             "{\"t\":200.0,\"type\":\"DOTA_COMBATLOG_DAMAGE\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"value\":60,\"attacker_team\":2,\"target_team\":3}"
         );
-        Files.write(combat, combatRows);
+        writeRealCombat(combat, combatRows);
 
         List<String> playerRows = List.of(
             "{\"t\":0.0,\"tick\":0,\"player\":0}",
@@ -76,9 +76,211 @@ class MetricsRunnerTest {
     }
 
     @Test
+    void separatesCopiedUnitsAegisAndScoreSources() throws Exception {
+        runMetrics();
+        Path combat = dir.resolve("combatlog.ndjson");
+        Path players = dir.resolve("players.ndjson");
+        List<String> events = new ArrayList<>(Files.readAllLines(combat));
+        for (int i = 0; i < 8; i++) {
+            events.add("""
+                {"t":110,"type":"DOTA_COMBATLOG_DAMAGE","attacker":"npc_dota_hero_pudge","attacker_hero":true,"attacker_illusion":true,"attacker_team":3,"target":"npc_dota_hero_pudge","target_hero":true,"target_illusion":false,"target_team":2,"damage_source":"npc_dota_hero_dark_seer","value":100}
+                """);
+        }
+        String copiedDeath = """
+            {"t":111,"type":"DOTA_COMBATLOG_DEATH","attacker":"npc_dota_hero_pudge","attacker_hero":true,"attacker_illusion":true,"attacker_team":3,"target":"npc_dota_hero_pudge","target_hero":true,"target_illusion":false,"target_team":2,"target_self":false,"damage_source":"npc_dota_hero_dark_seer","value":0,"networth":9999}
+            """;
+        events.add(copiedDeath);
+        events.add(copiedDeath.replace("111", "130"));
+        events.add(copiedDeath.replace("111", "150").replace("npc_dota_hero_dark_seer", "npc_dota_hero_axe"));
+        events.add(copiedDeath.replace("111", "170").replace("npc_dota_hero_pudge\",\"attacker_hero\":true", "npc_dota_badguys_tower1_mid\",\"attacker_hero\":false"));
+        Files.write(combat, events);
+        List<String> samples = new ArrayList<>(Files.readAllLines(players));
+        ObjectNode base = (ObjectNode) MAPPER.readTree(samples.get(2));
+        ObjectNode ds = base.deepCopy();
+        ds.put("player", 2).put("hero", "DarkSeer").put("team", 3);
+        samples.add(ds.toString());
+        for (int t : new int[]{110, 112, 117, 129, 131}) {
+            ObjectNode p = base.deepCopy();
+            p.put("t", t).put("tick", t * 30).put("deaths", t >= 131 ? 2 : 1);
+            p.put("hp", t == 112 || t == 131 ? 0 : 100);
+            p.putObject("items").put("slot0", t == 110 ? "item_aegis" : "item_blink");
+            samples.add(p.toString());
+        }
+        Files.write(players, samples);
+        Files.writeString(dir.resolve("match.json"), "{\"radiant_score\":2,\"dire_score\":4}");
+        ObjectNode m = new MetricsRunner(combat, players).run();
+        assertEquals(5, m.path("kills").size(), "Aegis is retained separately, not a scored death");
+        JsonNode aegis = m.path("hero_death_events").get(2);
+        assertEquals("aegis_respawn", aegis.path("death_class").asText());
+        JsonNode kill = m.path("kills").get(2);
+        assertEquals("dark_seer", kill.path("killer_key").asText());
+        assertEquals("npc_dota_hero_pudge", kill.path("attacker_unit").asText());
+        assertEquals("scored_death", kill.path("death_class").asText());
+        assertTrue(!kill.has("victim_networth"));
+        assertEquals(9999, kill.path("raw_networth").asInt());
+        assertTrue(!m.path("kills").get(3).has("killer_key"), "unrecognized illusion source stays unknown");
+        assertTrue(!m.path("kills").get(4).has("killer_key"), "tower is not a player kill");
+        assertEquals("unknown", m.path("kills").get(3).path("death_class").asText(), "sparse samples do not erase deaths");
+        assertEquals("official_team_counters", m.path("summary").path("team_kills_source").asText());
+        assertEquals(4, m.path("summary").path("team_kills").get(1).path("kills").asInt());
+        assertEquals(3, m.path("summary").path("player_kills_by_team").get(1).path("kills").asInt());
+        assertEquals(1, m.path("summary").path("non_player_last_hits").get(0).path("deaths").asInt());
+        JsonNode dsDamage = null;
+        for (JsonNode d : m.path("damage")) if (d.path("hero").asText().equals("dark_seer")) dsDamage = d;
+        assertTrue(dsDamage != null);
+        assertEquals(800, dsDamage.path("dealt_total").asInt());
+        for (JsonNode f : m.path("teamfights")) {
+            if (f.path("start").asInt() == 110) {
+                assertEquals(0, f.path("deaths").asInt());
+                assertEquals(800, f.path("player_stats").path("dark_seer").path("damage_dealt").asInt());
+                assertEquals(0, f.path("player_stats").path("pudge").path("damage_dealt").asInt());
+            }
+        }
+        // Player counters can advance just before the combat-log timestamp.
+        ObjectNode earlyDead = base.deepCopy();
+        earlyDead.put("t", 129.9).put("tick", 3897).put("hp", 0).put("deaths", 2);
+        samples.add(earlyDead.toString());
+        Files.write(players, samples);
+        m = new MetricsRunner(combat, players).run();
+        assertEquals("scored_death", m.path("kills").get(2).path("death_class").asText());
+        // Two DEATHs cannot both claim the same single counter increment.
+        events.add(copiedDeath.replace("111", "130.1"));
+        Files.write(combat, events);
+        m = new MetricsRunner(combat, players).run();
+        assertEquals("unknown", m.path("kills").get(2).path("death_class").asText());
+        assertEquals("unknown", m.path("kills").get(3).path("death_class").asText());
+        events.remove(events.size() - 1);
+        events.add(copiedDeath.replace("111", "113").replace("\"target_illusion\":false", "\"target_illusion\":true"));
+        events.add(copiedDeath.replace("111", "114").replace("\"target_team\":2", "\"target_team\":3"));
+        events.add(copiedDeath.replace("111", "130.5").replace("\"target_illusion\":false", "\"target_illusion\":true"));
+        events.add(copiedDeath.replace("111", "130.6").replace("\"target_team\":2", "\"target_team\":3"));
+        Files.write(combat, events);
+        m = new MetricsRunner(combat, players).run();
+        assertEquals("aegis_respawn", m.path("hero_death_events").get(2).path("death_class").asText(),
+            "same-name illusions and other-team bodies cannot block Aegis classification");
+        for (JsonNode event : m.path("hero_death_events")) {
+            if (event.path("t").asDouble() == 130)
+                assertEquals("scored_death", event.path("death_class").asText());
+        }
+    }
+
+    // These legacy fixtures intentionally model real units; missing-identity tests remove the flags explicitly.
+    private void writeRealCombat(Path combat, List<String> rows) throws Exception {
+        List<String> explicit = new ArrayList<>();
+        for (String row : rows) {
+            ObjectNode event = (ObjectNode) MAPPER.readTree(row);
+            event.put("attacker_illusion", false).put("target_illusion", false);
+            explicit.add(event.toString());
+        }
+        Files.write(combat, explicit);
+    }
+
+    @Test
+    void missingIdentityAndCopiedControlsStayUnattributed() throws Exception {
+        runMetrics();
+        Path combat = dir.resolve("combatlog.ndjson");
+        List<String> rows = new ArrayList<>(Files.readAllLines(combat));
+        for (int i : new int[]{2, 4, 5}) {
+            ObjectNode event = (ObjectNode) MAPPER.readTree(rows.get(i));
+            event.remove("attacker_illusion");
+            event.remove("target_illusion");
+            rows.set(i, event.toString());
+        }
+        ObjectNode control = (ObjectNode) MAPPER.readTree(rows.get(5));
+        control.put("target_illusion", true).put("inflictor", "illusion_stun");
+        rows.add(control.toString());
+        control.put("target_illusion", false).put("target_team", 2).put("inflictor", "copy_stun");
+        rows.add(control.toString());
+        Files.write(combat, rows);
+        ObjectNode m = new MetricsRunner(combat, dir.resolve("players.ndjson")).run();
+        JsonNode incident = m.path("incidents").path("deaths").get(0);
+        assertTrue(incident.path("victim_actions").isEmpty());
+        assertTrue(incident.path("controls_received").isEmpty());
+        try (Connection conn = DriverManager.getConnection("jdbc:duckdb:" + dir.resolve("metrics.duckdb"));
+             var rs = conn.createStatement().executeQuery("SELECT credited_attacker_key,target_player_key FROM combatlog WHERE t=100 AND type='DOTA_COMBATLOG_DAMAGE'")) {
+            assertTrue(rs.next());
+            assertEquals(null, rs.getString(1));
+            assertEquals(null, rs.getString(2));
+        }
+        // Entirely absent columns have the same unknown semantics as per-row missing values.
+        for (int i = 0; i < rows.size(); i++) {
+            ObjectNode event = (ObjectNode) MAPPER.readTree(rows.get(i));
+            event.remove("attacker_illusion");
+            event.remove("target_illusion");
+            rows.set(i, event.toString());
+        }
+        Files.write(combat, rows);
+        m = new MetricsRunner(combat, dir.resolve("players.ndjson")).run();
+        assertTrue(m.path("damage").isEmpty());
+        assertTrue(m.path("incidents").path("deaths").get(0).path("controls_received").isEmpty());
+    }
+
+    @Test
+    void incomeSurvivesMissingFarmCountersWithoutInventingZero() throws Exception {
+        runMetrics();
+        Path players = dir.resolve("players.ndjson");
+        List<String> rows = new ArrayList<>(Files.readAllLines(players));
+        for (int i = 0; i < rows.size(); i++) {
+            ObjectNode p = (ObjectNode) MAPPER.readTree(rows.get(i));
+            p.remove("last_hits");
+            p.putNull("denies");
+            rows.set(i, p.toString());
+        }
+        Files.write(players, rows);
+        ObjectNode m = new MetricsRunner(dir.resolve("combatlog.ndjson"), players).run();
+        assertEquals(2, m.path("farm_curves").size());
+        JsonNode point = m.path("farm_curves").get(1).path("points").get(0);
+        assertEquals(1200, point.path("total_earned_gold").asInt());
+        assertTrue(!point.has("last_hits"));
+        assertTrue(!point.has("denies"));
+    }
+
+    @Test
+    void unknownSourcesAndIllusionVictimsDoNotBecomePersonalDamageOrDeaths() throws Exception {
+        ObjectNode baseline = runMetrics();
+        Path combat = dir.resolve("combatlog.ndjson");
+        List<String> rows = new ArrayList<>(Files.readAllLines(combat));
+        ObjectNode damage = (ObjectNode) MAPPER.readTree(rows.get(2));
+        damage.put("t", 220).put("attacker_illusion", true).put("value", 9999);
+        damage.put("damage_source", "npc_dota_hero_axe");
+        rows.add(damage.toString()); // Same-team copy but conflicting source: unknown.
+        damage.put("attacker_illusion", false).put("target_illusion", true);
+        rows.add(damage.toString()); // Real hero hitting an illusion is not player damage.
+        damage.put("type", "DOTA_COMBATLOG_DEATH");
+        rows.add(damage.toString());
+        // Item/ability events legitimately omit teams; keep real-hero action evidence.
+        ObjectNode action = (ObjectNode) MAPPER.readTree(rows.get(4));
+        action.remove("attacker_team");
+        action.put("inflictor", "axe_test_action");
+        rows.add(action.toString());
+        Files.write(combat, rows);
+        ObjectNode m = new MetricsRunner(combat, dir.resolve("players.ndjson")).run();
+        assertEquals(2, m.path("kills").size());
+        assertEquals("illusion_death", m.path("hero_death_events").get(2).path("death_class").asText());
+        long baselinePudgeDamage = 0;
+        for (JsonNode d : baseline.path("damage")) {
+            if (d.path("hero").asText().equals("pudge")) baselinePudgeDamage = d.path("dealt_total").asLong();
+        }
+        for (JsonNode d : m.path("damage")) {
+            if (d.path("hero").asText().equals("pudge")) {
+                assertEquals(baselinePudgeDamage, d.path("dealt_total").asLong());
+            }
+        }
+        assertTrue(m.path("incidents").path("deaths").get(0).path("victim_actions").toString().contains("axe_test_action"));
+        try (Connection conn = DriverManager.getConnection("jdbc:duckdb:" + dir.resolve("metrics.duckdb"))) {
+            try (var rs = conn.createStatement().executeQuery("SELECT SUM(dealt_total) FROM damage")) {
+                rs.next();
+                long jsonSum = 0;
+                for (JsonNode d : m.path("damage")) jsonSum += d.path("dealt_total").asLong();
+                assertEquals(jsonSum, rs.getLong(1));
+            }
+        }
+    }
+
+    @Test
     void computesSummary() throws Exception {
         ObjectNode m = runMetrics();
-        assertEquals(12, m.path("schema_version").asInt());
+        assertEquals(14, m.path("schema_version").asInt());
         assertEquals(5, m.path("parameters").path("teamfight_bucket_sec").asInt());
         com.fasterxml.jackson.databind.JsonNode s = m.path("summary");
         assertEquals(2, s.path("team_kills").size());
@@ -144,7 +346,7 @@ class MetricsRunnerTest {
     void infersLanesFromEarlyPositions() throws Exception {
         Path combat = dir.resolve("combatlog.ndjson");
         Path players = dir.resolve("players.ndjson");
-        Files.write(combat, List.of(
+        writeRealCombat(combat, List.of(
             "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"attacker_team\":2,\"target_team\":3,\"value\":300,\"value_name\":\"none\",\"x\":1.0,\"y\":2.0,\"networth\":1200,\"assists\":[]}"
         ));
         // p0 bottom (x>0,y<0), p1 top (x<0,y>0), p2 mid (x,y same sign, near centre), p3 bottom (dire)
@@ -194,7 +396,7 @@ class MetricsRunnerTest {
     void computesObjectives() throws Exception {
         Path combat = dir.resolve("combatlog.ndjson");
         Path players = dir.resolve("players.ndjson");
-        Files.write(combat, List.of(
+        writeRealCombat(combat, List.of(
             // roshan death + a dire tower deny + two radiant building kills
             "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_roshan\",\"target_hero\":false,\"attacker_team\":2,\"target_team\":0,\"value\":165,\"x\":-1000.0,\"y\":-1000.0,\"networth\":1000,\"assists\":[]}",
             "{\"t\":150.0,\"type\":\"DOTA_COMBATLOG_TEAM_BUILDING_KILL\",\"attacker\":\"dota_unknown\",\"attacker_hero\":false,\"target\":\"npc_dota_badguys_tower1_mid\",\"target_hero\":false,\"attacker_team\":3,\"target_team\":3,\"value\":1}",
@@ -231,7 +433,7 @@ class MetricsRunnerTest {
     void computesFarmCurves() throws Exception {
         Path combat = dir.resolve("combatlog.ndjson");
         Path players = dir.resolve("players.ndjson");
-        Files.write(combat, List.of(
+        writeRealCombat(combat, List.of(
             "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"attacker_team\":2,\"target_team\":3,\"value\":300,\"value_name\":\"none\",\"x\":1.0,\"y\":2.0,\"networth\":1200,\"assists\":[]}"
         ));
         // two samples per hero: values must be monotonic across buckets (MAX picks the latest)
@@ -262,7 +464,7 @@ class MetricsRunnerTest {
     void computesDeathCosts() throws Exception {
         Path combat = dir.resolve("combatlog.ndjson");
         Path players = dir.resolve("players.ndjson");
-        Files.write(combat, List.of(
+        writeRealCombat(combat, List.of(
             // kill 1: pudge (team 2) kills axe; killer team gains gold/xp right after, then concedes a building
             "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"attacker_team\":2,\"target_team\":3,\"value\":300,\"value_name\":\"none\",\"x\":1.0,\"y\":2.0,\"networth\":1200,\"assists\":[]}",
             "{\"t\":100.5,\"type\":\"DOTA_COMBATLOG_GOLD\",\"target\":\"npc_dota_hero_pudge\",\"target_key\":\"pudge\",\"value\":250,\"gold_reason\":12}",
@@ -296,7 +498,7 @@ class MetricsRunnerTest {
     void teamKillsUseAttackerTeam() throws Exception {
         Path combat = dir.resolve("combatlog.ndjson");
         Path players = dir.resolve("players.ndjson");
-        Files.write(combat, List.of(
+        writeRealCombat(combat, List.of(
             // pudge (team 2) kills axe (team 3) twice, axe kills pudge once
             "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"attacker_team\":2,\"target_team\":3,\"value\":300,\"x\":1.0,\"y\":2.0,\"networth\":1200,\"assists\":[0]}",
             "{\"t\":101.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"attacker_team\":2,\"target_team\":3,\"value\":300,\"x\":1.0,\"y\":2.0}",
@@ -337,7 +539,7 @@ class MetricsRunnerTest {
     void goldCurveUsesLastCumulativeValueInBucket() throws Exception {
         Path combat = dir.resolve("combatlog.ndjson");
         Path players = dir.resolve("players.ndjson");
-        Files.write(combat, List.of(
+        writeRealCombat(combat, List.of(
             "{\"t\":10.0,\"type\":\"DOTA_COMBATLOG_GOLD\",\"target\":\"npc_dota_hero_pudge\",\"value\":300,\"attacker_hero\":false,\"target_hero\":true,\"attacker_team\":0,\"target_team\":2}",
             "{\"t\":20.0,\"type\":\"DOTA_COMBATLOG_GOLD\",\"target\":\"npc_dota_hero_pudge\",\"value\":-100,\"attacker_hero\":false,\"target_hero\":true,\"attacker_team\":0,\"target_team\":2}",
             "{\"t\":20.0,\"type\":\"DOTA_COMBATLOG_GOLD\",\"target\":\"npc_dota_hero_pudge\",\"value\":50,\"attacker_hero\":false,\"target_hero\":true,\"attacker_team\":0,\"target_team\":2}",
@@ -357,7 +559,7 @@ class MetricsRunnerTest {
     void normalizesGameClockAndUsesReplayWinner() throws Exception {
         Path combat = dir.resolve("combatlog.ndjson");
         Path players = dir.resolve("players.ndjson");
-        Files.write(combat, List.of(
+        writeRealCombat(combat, List.of(
             "{\"t\":300.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"attacker_team\":2,\"target_team\":3,\"value\":300,\"value_name\":\"none\",\"x\":1,\"y\":2,\"networth\":1000,\"assists\":[]}"
         ));
         Files.write(players, List.of(
@@ -383,7 +585,7 @@ class MetricsRunnerTest {
         Path combat = dir.resolve("combatlog.ndjson");
         Path players = dir.resolve("players.ndjson");
         // missing attacker_team / target_team / attacker_hero would silently skew team_kills and damage
-        Files.write(combat, List.of(
+        writeRealCombat(combat, List.of(
             "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"value\":300}"
         ));
         Files.write(players, List.of(
@@ -491,7 +693,7 @@ class MetricsRunnerTest {
     void rejectsPlayersMissingTeam() throws Exception {
         Path combat = dir.resolve("combatlog.ndjson");
         Path players = dir.resolve("players.ndjson");
-        Files.write(combat, List.of(
+        writeRealCombat(combat, List.of(
             "{\"t\":100.0,\"type\":\"DOTA_COMBATLOG_DEATH\",\"attacker\":\"npc_dota_hero_pudge\",\"attacker_hero\":true,\"target\":\"npc_dota_hero_axe\",\"target_hero\":true,\"attacker_team\":2,\"target_team\":3,\"value\":300}"
         ));
         // player rows carry no team -> side attribution in roster / team_kills would be broken

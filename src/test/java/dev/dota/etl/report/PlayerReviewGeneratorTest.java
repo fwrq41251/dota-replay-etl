@@ -20,6 +20,7 @@ class PlayerReviewGeneratorTest {
 
     private Path writeFixture() throws Exception {
         ObjectNode metrics = MAPPER.createObjectNode();
+        metrics.put("schema_version", dev.dota.etl.util.BuildInfo.METRICS_SCHEMA_VERSION);
 
         ObjectNode summary = metrics.putObject("summary");
         summary.put("duration_sec", 300.0);
@@ -55,13 +56,13 @@ class PlayerReviewGeneratorTest {
         ObjectNode k = kills.addObject();
         k.put("t", 120.5).put("killer", "npc_dota_hero_pudge").put("victim", "npc_dota_hero_axe")
          .put("killer_key", "pudge").put("victim_key", "axe")
-         .put("killer_team", 2).put("victim_team", 3).put("victim_networth", 800);
+         .put("killer_team", 2).put("victim_team", 3).put("raw_networth", 800);
         ArrayNode loc = k.putArray("location");
         loc.add(-2500.0).add(1000.0);
         ObjectNode k2 = kills.addObject();
         k2.put("t", 200.0).put("killer", "npc_dota_hero_axe").put("victim", "npc_dota_hero_pudge")
           .put("killer_key", "axe").put("victim_key", "pudge")
-          .put("killer_team", 3).put("victim_team", 2).put("victim_networth", 1200);
+          .put("killer_team", 3).put("victim_team", 2).put("raw_networth", 1200);
 
         ObjectNode incident = metrics.putObject("incidents").putArray("deaths").addObject();
         incident.put("incident_id", "death-1").put("type", "hero_death").put("kill_id", 1)
@@ -142,9 +143,9 @@ class PlayerReviewGeneratorTest {
         assertTrue(prompt.contains("stunned（axe）"), "pre-death control evidence");
         assertTrue(prompt.contains("|axe|"), "kill/death victim/killer");
         assertTrue(prompt.contains("经济对比"), "economy section");
-        assertTrue(prompt.contains("|15|2500|1800|"), "economy row value");
+        assertTrue(prompt.contains("|2|800|未知|"), "missing opponent income is not zero");
         assertTrue(prompt.contains("对英雄总伤害：1000"), "damage total");
-        assertTrue(prompt.contains("有实质参与的交战窗口"), "teamfight section");
+        assertTrue(prompt.contains("有实质参与的全地图活动窗口"), "teamfight section");
         assertTrue(prompt.contains("个人输出/承伤"), "personal fight evidence");
         assertTrue(prompt.contains("打钱/位置分析"), "position section");
         assertTrue(prompt.contains("累计获得金币 800，补刀 6（1.2/分钟），反补 1"), "farm totals line");
@@ -152,6 +153,50 @@ class PlayerReviewGeneratorTest {
         assertTrue(prompt.contains("出装决策"), "question 1");
         assertTrue(prompt.contains("改进优先级"), "question 5");
         assertTrue(Files.exists(dir.resolve("player-review-pudge.md")));
+    }
+
+    @Test
+    void negativeGoldDoesNotImplyIncomeStallOrEnemyTopEarner() throws Exception {
+        Path file = writeFixture();
+        ObjectNode m = (ObjectNode) MAPPER.readTree(Files.readString(file));
+        ((ObjectNode) m.path("gold_curves").get(0).path("points").get(2)).put("gold", -5000);
+        ((ObjectNode) m.path("gold_curves").get(1).path("points").get(2)).put("gold", 99999);
+        Files.writeString(file, m.toString());
+        String prompt = new PlayerReviewGenerator(dir, "pudge").generatePrompt();
+        assertTrue(!prompt.contains("近乎停滞"));
+        assertTrue(!prompt.contains("最高的英雄 axe"));
+        assertTrue(prompt.contains("total_earned_gold"));
+        assertTrue(prompt.contains("不是到手或可用时间"));
+        assertTrue(prompt.contains("不代表团战因果收益"));
+    }
+
+    @Test
+    void opponentRankingRequiresCompleteCoverageAndDoesNotUseStaleIncome() throws Exception {
+        Path file = writeFixture();
+        ObjectNode m = (ObjectNode) MAPPER.readTree(Files.readString(file));
+        ArrayNode farm = m.putArray("farm_curves");
+        ArrayNode own = farm.addObject().put("hero", "pudge").putArray("points");
+        own.addObject().put("t", 0).put("total_earned_gold", 800);
+        own.addObject().put("t", 600).put("total_earned_gold", 1200);
+        ArrayNode other = farm.addObject().put("hero", "axe").putArray("points");
+        other.addObject().put("t", 300).put("total_earned_gold", 99999);
+        other.addObject().put("t", 600).put("total_earned_gold", 100000);
+        Files.writeString(file, m.toString());
+        String prompt = new PlayerReviewGenerator(dir, "pudge").generatePrompt();
+        assertTrue(prompt.contains("|0|800|未知|"));
+        assertTrue(prompt.contains("|5|未知|99999|"));
+        assertTrue(prompt.contains("|10|1200|100000|"));
+        assertTrue(prompt.contains("最早在约第 10 分钟"), "no inferred lead while own sample is stale");
+        ((ArrayNode) m.path("roster")).addObject().put("hero_key", "lion").put("team", 3);
+        Files.writeString(file, m.toString());
+        prompt = new PlayerReviewGenerator(dir, "pudge").generatePrompt();
+        assertTrue(prompt.contains("最高的英雄 未知（数据不全）"));
+        assertTrue(!prompt.contains("最早在约第"));
+        ((ObjectNode) other.get(1)).putNull("total_earned_gold");
+        ((ArrayNode) m.path("roster")).remove(2);
+        Files.writeString(file, m.toString());
+        prompt = new PlayerReviewGenerator(dir, "pudge").generatePrompt();
+        assertTrue(prompt.contains("最高的英雄 未知（数据不全）"), "null and stale final data cannot rank the opponent");
     }
 
     @Test

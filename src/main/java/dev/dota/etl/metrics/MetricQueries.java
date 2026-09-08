@@ -115,9 +115,9 @@ final class MetricQueries {
         return """
             WITH act AS (
               SELECT FLOOR(t / {BUCKET}) * {BUCKET} AS b,
-                     COUNT(*) FILTER (WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND attacker LIKE 'npc_dota_hero_%') AS dmg_events,
+                     COUNT(*) FILTER (WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_player_key IS NOT NULL AND attacker LIKE 'npc_dota_hero_%') AS dmg_events,
                      COUNT(*) FILTER (WHERE type='DOTA_COMBATLOG_DEATH' AND target_hero) AS deaths
-              FROM combatlog_v
+              FROM activity_v
               WHERE t >= (SELECT MIN(t) FROM combatlog_v)
               GROUP BY 1
             ),
@@ -143,9 +143,9 @@ final class MetricQueries {
             )
             SELECT ROW_NUMBER() OVER (ORDER BY start_b) - 1 AS id,
                    start_b AS start, end_b AS end,
-                   COALESCE(SUM(CASE WHEN c.type='DOTA_COMBATLOG_DAMAGE' AND c.target_hero AND c.attacker LIKE 'npc_dota_hero_%' THEN c.value END), 0) AS hero_damage,
+                   COALESCE(SUM(CASE WHEN c.type='DOTA_COMBATLOG_DAMAGE' AND c.target_player_key IS NOT NULL AND c.attacker LIKE 'npc_dota_hero_%' THEN c.value END), 0) AS hero_damage,
                    COUNT(*) FILTER (WHERE c.type='DOTA_COMBATLOG_DEATH' AND c.target_hero) AS deaths
-            FROM episodes e JOIN combatlog_v c ON c.t >= e.start_b AND c.t < e.end_b
+            FROM episodes e JOIN activity_v c ON c.t >= e.start_b AND c.t < e.end_b
             GROUP BY e.grp, start_b, end_b ORDER BY start_b
             """.replace("{BUCKET}", String.valueOf(BUCKET_SEC))
             .replace("{MIN_ACTIVE}", String.valueOf(MIN_ACTIVE_SCORE))
@@ -154,12 +154,13 @@ final class MetricQueries {
 
     static String teamfightEventsBatchSql() {
         return """
-            SELECT e.id, c.t, c.attacker_key, c.target_key, c.type, c.value
+            SELECT e.id, c.t, c.credited_attacker_key AS attacker_key,
+                   c.target_player_key AS target_key, c.type, c.value
             FROM tf_episodes e
-            JOIN combatlog_v c ON c.t >= e.start AND c.t < e."end"
-            WHERE (c.type='DOTA_COMBATLOG_DAMAGE' AND c.target_hero AND c.attacker LIKE 'npc_dota_hero_%') OR
+            JOIN activity_v c ON c.t >= e.start AND c.t < e."end"
+            WHERE (c.type='DOTA_COMBATLOG_DAMAGE' AND c.target_player_key IS NOT NULL AND c.attacker LIKE 'npc_dota_hero_%') OR
                   (c.type='DOTA_COMBATLOG_DEATH' AND c.target_hero) OR
-                  (c.type='DOTA_COMBATLOG_HEAL' AND c.target_hero AND c.attacker LIKE 'npc_dota_hero_%')
+                  (c.type='DOTA_COMBATLOG_HEAL' AND c.target_player_key IS NOT NULL AND c.attacker LIKE 'npc_dota_hero_%')
             """;
     }
 
@@ -184,7 +185,7 @@ final class MetricQueries {
               SELECT hero_key, t, total_earned_gold, last_hits, denies, FLOOR(t / 60.0) AS bucket
               FROM players_v
               WHERE hero_key IS NOT NULL AND team IN (2, 3)
-                AND total_earned_gold IS NOT NULL AND last_hits IS NOT NULL AND denies IS NOT NULL
+                AND total_earned_gold IS NOT NULL
             )
             GROUP BY hero, bucket ORDER BY hero, bucket
             """;
@@ -222,20 +223,20 @@ final class MetricQueries {
 
     static String damagePerMinuteSql() {
         return """
-            SELECT attacker_key AS hero, FLOOR(t / 60) AS minute, SUM(value) AS dealt
+            SELECT credited_attacker_key AS hero, FLOOR(t / 60) AS minute, SUM(value) AS dealt
             FROM combatlog_v
             WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero
-              AND attacker LIKE 'npc_dota_hero_%' AND attacker_key IS NOT NULL
-            GROUP BY attacker_key, minute ORDER BY attacker_key, minute
+              AND credited_attacker_key IS NOT NULL AND target_player_key IS NOT NULL
+            GROUP BY credited_attacker_key, minute ORDER BY credited_attacker_key, minute
             """;
     }
 
     static String damageTakenSql() {
         return """
-            SELECT target_key AS hero, SUM(value) AS taken_total
+            SELECT target_player_key AS hero, SUM(value) AS taken_total
             FROM combatlog_v
-            WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND target_key IS NOT NULL
-            GROUP BY target_key
+            WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND target_player_key IS NOT NULL
+            GROUP BY target_player_key
             """;
     }
 
@@ -244,15 +245,15 @@ final class MetricQueries {
             SELECT COALESCE(d.hero, t.hero) AS hero,
                    COALESCE(d.dealt_total, 0) AS dealt_total,
                    COALESCE(t.taken_total, 0) AS taken_total
-            FROM (SELECT attacker_key AS hero, SUM(value) AS dealt_total
+            FROM (SELECT credited_attacker_key AS hero, SUM(value) AS dealt_total
                   FROM combatlog_v
                   WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero
-                    AND attacker LIKE 'npc_dota_hero_%' AND attacker_key IS NOT NULL
-                  GROUP BY attacker_key) d
-            FULL OUTER JOIN (SELECT target_key AS hero, SUM(value) AS taken_total
+                    AND credited_attacker_key IS NOT NULL AND target_player_key IS NOT NULL
+                  GROUP BY credited_attacker_key) d
+            FULL OUTER JOIN (SELECT target_player_key AS hero, SUM(value) AS taken_total
                   FROM combatlog_v
-                  WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND target_key IS NOT NULL
-                  GROUP BY target_key) t ON d.hero = t.hero
+                  WHERE type='DOTA_COMBATLOG_DAMAGE' AND target_hero AND target_player_key IS NOT NULL
+                  GROUP BY target_player_key) t ON d.hero = t.hero
             ORDER BY hero
             """;
     }

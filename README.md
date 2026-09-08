@@ -157,6 +157,46 @@ game timestamps in this extraction stream and are normalized to horn-relative ti
 
 ## Metrics
 
+### Schema 13 Semantic Corrections
+
+Schema 14 tightens these rules after review: missing illusion flags no longer establish real-unit
+identity (including actions and control recipients). Death uniqueness ignores known illusions and
+other-team copies. Income comparisons require coverage of every relevant roster hero and an
+available sample at the compared time; before the first sample or more than 60 seconds after the
+latest sample, values are unknown, not zero. Opponent ranking uses a common comparison time and
+requires the entire enemy roster. Missing last-hit/deny counters no longer discard income samples,
+and missing counters remain unknown in JSON/reports. Recompute metrics to replace schema 13 output.
+
+Re-run `metrics` and then `report` / `player-review` on existing extraction output to migrate.
+Reports reject missing, older and newer metrics schema versions, even without a replay hash.
+No replay re-extraction is required. DuckDB records its version in `metric_metadata`.
+
+- `attacker` / `attacker_key` in DuckDB retain the actual unit identity. Personal attribution uses
+  `credited_attacker_key`; JSON kills expose `attacker_unit`, `killer_key` and `attribution_source`.
+  A direct hero needs a matching roster team. An illusion needs matching source/team evidence;
+  enemy hero copies are attributed only for the explicitly supported Dark Seer source rule.
+  Other `damage_source` values are not assumed to be owners. Unverifiable attribution stays unknown.
+  Personal damage, kill and activity-window statistics share these rules; illusion activity does
+  not prove that the owner's real hero was present. Damage to known illusions is not player damage.
+- `hero_death_events` retains all raw hero DEATHs with stable IDs and classification evidence.
+  `scored_death` requires a single event and a player death-counter increment, comparing a living
+  sample within 5 seconds before the event with the first sample within 5 seconds after it.
+  `aegis_respawn` additionally requires a living Aegis holder, HP zero with Aegis gone after DEATH,
+  and a living sample within 10 seconds with the same death counter and no Aegis. It is excluded
+  from `kills`, death incidents and activity-window death exchanges, but remains in JSON and DuckDB.
+  Known illusion deaths are likewise separated. Missing or ambiguous evidence is `unknown`, retained
+  in death lists/window counts and explicitly not claimed to be verified scoreboard deaths.
+- Summary reconciliation distinguishes official team counters, final personal kill sums, raw death
+  classifications and non-player last hits. Tower kills need not increment any player's kill count.
+- The raw combat-log `networth` is retained as `raw_networth` in JSON, not `victim_networth`;
+  neither victim nor killer net worth is inferred from it.
+- `gold_curves` is a signed GOLD-event cumulative sum, not cumulative income or net worth.
+  Reports use authoritative `farm_curves.total_earned_gold` for income comparisons and do not infer
+  an income stall from negative GOLD events. JSON `semantics` documents each metric's meaning.
+- `teamfights` keeps its existing algorithm/API name but means **global activity windows**, not
+  spatially isolated fights. Window GOLD/XP includes objectives, passive gains and spending;
+  it is temporal correlation, not causal fight profit. Equipment times mean PURCHASE, not delivery.
+
 `dota-replay-etl metrics <out>/<matchId>` loads the NDJSON streams into an in-memory
 DuckDB, computes the metrics below, and writes `metrics.json` plus a persistent
 `metrics.duckdb`. The DuckDB file exposes the raw streams (`combatlog`, `players`,
@@ -187,7 +227,7 @@ official hero-kill counter (with final roster deaths as a fallback for older ext
                "side": "radiant", "level": 25, "kills": 3, "deaths": 3, "assists": 9,
                "lane": "top", "lane_confidence": 94} ],
   "kills": [ { "kill_id": 0, "t": 884.9, "killer": "...", "killer_key": "marci", "victim": "...", "victim_key": "lone_druid",
-                "killer_team": 3, "victim_team": 2, "location": [-6111.0, -5903.0], "victim_networth": 870,
+                 "killer_team": 3, "victim_team": 2, "location": [-6111.0, -5903.0], "raw_networth": 870,
                 "assist_players": [9, 8, 5], "killer_team_gold": 284, "killer_team_xp": 120,
                 "conceded_objective": { "t": 892.4, "target": "npc_dota_badguys_tower1_top",
                                         "target_key": "badguys_tower1_top", "kind": "building" } } ],
@@ -214,8 +254,8 @@ official hero-kill counter (with final roster deaths as a fallback for older ext
 
 Notes:
 
-- `team_kills`, `kills` and teamfight `deaths` count **hero** deaths only (the raw combat log
-  also records creep / tower / neutral deaths).
+- `team_kills` uses official scores when available. `kills` and window `deaths` exclude verified
+  Aegis/illusion deaths, retaining explicitly unknown classifications (see schema 13 above).
 - Every hero death has a stable `kill_id`, shared by `kills`, `death_costs` and
   `conceded_objectives` for lossless DuckDB joins.
 - Hero keys are normalised snake_case (`npc_dota_hero_lone_druid` -> `lone_druid`) so the
@@ -226,8 +266,8 @@ Notes:
   assigns every sample to the top (`x < 0, y > 0`), bottom (`x > 0, y < 0`) or mid (x,y same sign)
   map region, and picks the region holding the majority (fountain trips excluded, min 10 samples).
   The reports label this as 推断 and quote the confidence.
-- `gold_curves` / `xp_curves` are cumulative sums of combat-log GOLD / XP events per hero,
-  bucketed every 30 / 60 s (bucket centre time). Gold starts at 600 (starting gold).
+- `gold_curves` / `xp_curves` are signed cumulative sums of combat-log GOLD / XP events per hero,
+  bucketed every 30 / 60 s (bucket centre time). No synthetic starting gold is added.
 - `item_timeline` retains every purchase event, including repeated purchases of the same item.
 - `teamfights` are runs of 5-second activity buckets where
   `damage_events + 4*deaths >= 8`, where `damage_events` counts **hero-to-hero** damage
@@ -235,7 +275,7 @@ Notes:
   episode counts damage dealt *by* heroes. Each episode also carries an `economy` object:
   the net gold / XP gained by each team's heroes inside the window (summed from combat-log
   GOLD / XP events attributed via hero -> team; buyback costs count as negative gold,
-  building / Roshan gold is excluded), plus `gold_delta` / `xp_delta` as radiant minus dire.
+   building / Roshan gold is included), plus `gold_delta` / `xp_delta` as radiant minus dire.
   The knobs (`BUCKET_SEC`, `WEIGHT_DEATH`,
   `MIN_ACTIVE_SCORE`) live at the top of `MetricsRunner`.
 - `objectives` is the objective timeline. `roshan_kills` lists every Roshan death with its time,
@@ -255,8 +295,8 @@ Notes:
   they are **approximations** — the true kill bounty is not a reliable combat-log field, so the
   window also includes passive income / last-hits / buyback spend (which can make the value
   negative). `conceded_objective` (when present) is the first building or Roshan the killer team
-  took within 20 s of the death — an objective conceded off a kill is factual and is the clearest
-  death-cost signal. Knobs: `KILL_GOLD_WINDOW_SEC`, `KILL_FOLLOWUP_WINDOW_SEC` in `MetricsRunner`.
+   took within 20 s of the death; the ordering is factual, but causation is not established.
+   Knobs: `KILL_GOLD_WINDOW_SEC`, `KILL_FOLLOWUP_WINDOW_SEC` in `MetricQueries`.
   When the death combat-log event lacks coordinates, `location` falls back to the victim's latest
   player-state sample from at most 5 seconds earlier and is explicitly labelled with
   `location_source: player_sample` plus `location_age_sec`; reports render it as approximate.
@@ -289,8 +329,8 @@ The economy section shows the five-minute team income differential
 (carry-forward of each hero's cumulative income, labelled as a trend, not a bank balance),
 followed by an authoritative per-hero farm table (total earned gold, last hits, denies,
 last-hits-per-minute) from the player resource.
-The fight timeline includes each window's per-team gold change (see `teamfight.economy`),
-so "who won the fight" is a data-backed claim rather than a death-exchange guess.
+The global activity timeline includes each window's per-team signed gold change (see
+`teamfight.economy`), which must not be interpreted as causal fight profit.
 A new **客观目标时间线** section lists every Roshan kill (time + killer + team) and every
 building kill (time + building + destroying team) in game-clock order, so "this teamfight
 converted into a tower / Roshan / throne" becomes a factual claim. The final ancient kill
@@ -303,7 +343,7 @@ Copy `prompt.md` into any LLM to get the report, or paste it into a future `--ap
 review prompt for one hero into `player-review-<hero>.md` (dry-run). The selector matches a
 roster entry by `hero_key`, hero name, player name, or player index. Beyond the match-level
 metrics it adds: the hero's full purchase timeline, kills/deaths with positions, an income
-comparison against the enemy team's top earner (with auto-detected overtake / stall facts),
+comparison against the enemy team's top earner using player-resource counters (not signed GOLD),
 per-minute hero damage, the fights the hero actually participated in (with kill/death outcome
 and per-team gold change per fight), and a farming/position table derived from `players.ndjson`
 (the hero's inferred lane with its confidence is shown at the top; the table reports the share
